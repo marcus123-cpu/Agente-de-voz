@@ -1,0 +1,19 @@
+node_modules/
+dist/
+.env
+.env.local
+.env.*.local
+server/.env
+server/.env.tmp
+web/.env
+coverage/
+*.log
+supabase/.temp/
+*.tsbuildinfo
+
+# Dados internos da clínica e material de treinamento da Giovana (repositório público: não publicar)
+docs/amor-saude-*.md
+docs/giovana-*
+amostras-voz/
+UserspmarcAppDataLocalTemp/
+.vercel/
