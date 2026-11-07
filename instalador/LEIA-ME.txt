@@ -1,0 +1,40 @@
+INSTALADOR DO AGENTE DE VOZ (Central de Atendimento - Giovana)
+===============================================================
+
+COMO INSTALAR EM UM PC NOVO
+1. Copie esta pasta "instalador" inteira para o PC (pen drive, por exemplo).
+   Se houver o arquivo "segredos.env" dentro dela, a instalação não pergunta nada.
+2. Dê dois cliques em  Instalar.cmd
+3. Espere terminar (alguns minutos na primeira vez). Ele:
+     - confere Windows, internet, espaço e portas
+     - instala Git e Node.js se faltarem (o Windows pode pedir permissão)
+     - baixa o painel do GitHub
+     - instala as dependências e o navegador usado para controlar o cVortex
+     - cria a configuração e TESTA as chaves (ElevenLabs e Supabase)
+     - roda os testes do servidor
+     - cria na área de trabalho os atalhos "Agente de Voz" e "Atualizar Agente de Voz"
+4. No primeiro uso: abra o atalho "Agente de Voz", entre no painel, vá em
+   Conexões > "Abrir perfil cVortex" e faça o login no cVortex (uma vez por PC).
+
+COMO USAR NO DIA A DIA
+- Atalho "Agente de Voz": abre o servidor e o painel (http://localhost:5173).
+  Não feche a janela preta que aparece: ela é o servidor.
+- Atalho "Atualizar Agente de Voz" (ou rodar Instalar.cmd de novo): baixa a versão nova.
+
+SEM O ARQUIVO segredos.env
+O instalador pede: uma senha nova do operador (mínimo 10 caracteres), a chave da
+ElevenLabs, a chave secreta do Supabase e o ID do agente da Giovana. Nada aparece
+na tela enquanto você digita.
+
+SEGURANÇA
+- "segredos.env" contém senhas e chaves. Não envie por e-mail/WhatsApp, não suba
+  no GitHub (já está bloqueado no .gitignore) e apague do pen drive depois de instalar.
+- Use um PC por vez com o mesmo login do cVortex (a sessão é única).
+- A senha do operador atual é curta (4 caracteres). Troque por uma forte antes de
+  deixar o painel acessível pela internet.
+
+PROBLEMAS
+- "A porta 3001/5173 está em uso": o painel já está aberto; use o atalho para abrir o navegador.
+- Falha de ElevenLabs/Supabase na conferência: a chave está errada ou expirou; corrija server\.env.
+- O instalador pode ser rodado de novo quantas vezes quiser; ele continua de onde parou.
+- Teste só a verificação do PC:  Instalar.cmd -Verificar

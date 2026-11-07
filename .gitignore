@@ -17,3 +17,7 @@ docs/giovana-*
 amostras-voz/
 UserspmarcAppDataLocalTemp/
 .vercel/
+
+# Chaves copiadas para levar a outro PC (NUNCA enviar ao Git)
+instalador/segredos.env
+segredos.env
