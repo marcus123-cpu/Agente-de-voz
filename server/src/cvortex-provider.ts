@@ -28,8 +28,18 @@ export interface CvortexStartOptions {
   callId: string;
   phone: string;
   patientName: string;
-  contactContext: 'not_informed' | 'recent_card_member';
+  contactContext: 'not_informed' | 'recent_card_member' | 'appointment_confirmation';
   agentId: string;
+  /** Modelos de WhatsApp que a IA pode enviar (vira a variável {{modelos_whatsapp}} do prompt). */
+  whatsappModels?: string;
+  /** 'conectada' ou 'indisponivel (...)': vira a variável {{agenda_amei}} do prompt. */
+  ameiAgenda?: string;
+  /** Variáveis extras do prompt (ex.: dados da consulta a confirmar); sobrescrevem as padrão. */
+  extraVariables?: Record<string, string>;
+  /** Substitui o prompt do agente só nesta ligação (ex.: confirmação de consulta). */
+  promptOverride?: string;
+  /** Substitui a primeira fala do agente só nesta ligação. */
+  firstMessageOverride?: string;
   onStatus?: (status: CallStatus) => void | Promise<void>;
   onAgentConnected?: () => void | Promise<void>;
   onConversationId?: (conversationId: string) => void | Promise<void>;
@@ -37,6 +47,8 @@ export interface CvortexStartOptions {
   /** Escuta ao vivo (PCM16 16 kHz mono). Chamado de forma síncrona e barata. */
   onAudio?: (source: 'patient' | 'agent', pcm: Buffer) => void;
   onText?: (role: 'patient' | 'agent', text: string, correction?: boolean) => void;
+  /** Ferramentas que a IA aciona durante a ligação (client tools da ElevenLabs). Retorna o texto que a IA recebe de volta. */
+  onToolCall?: (name: string, parameters: Record<string, unknown>) => Promise<string>;
   onFlush?: () => void;
 }
 
@@ -427,7 +439,7 @@ class CvortexBrowserProvider {
     const agent = new WebSocket(data.signed_url);
     session.agentSocket = agent;
     agent.on('open', () => {
-      agent.send(JSON.stringify({ type: 'conversation_initiation_client_data', dynamic_variables: { patient_name: session.options.patientName, contact_context: session.options.contactContext, saudacao: greetingForNow() } }));
+      agent.send(JSON.stringify({ type: 'conversation_initiation_client_data', dynamic_variables: { patient_name: session.options.patientName, contact_context: session.options.contactContext, saudacao: greetingForNow(), modelos_whatsapp: session.options.whatsappModels ?? 'nenhum', agenda_amei: session.options.ameiAgenda ?? 'indisponivel', ...(session.options.extraVariables ?? {}) }, ...(session.options.promptOverride ? { conversation_config_override: { agent: { prompt: { prompt: session.options.promptOverride }, ...(session.options.firstMessageOverride ? { first_message: session.options.firstMessageOverride } : {}) } } } : {}) }));
     });
     agent.on('message', payload => {
       let message: any;
@@ -441,6 +453,14 @@ class CvortexBrowserProvider {
         if (session.browserSocket?.readyState === WebSocket.OPEN) session.browserSocket.send(JSON.stringify({ type: 'agent-ready' }));
       }
       if (message.type === 'ping' && message.ping_event?.event_id != null && agent.readyState === WebSocket.OPEN) agent.send(JSON.stringify({ type: 'pong', event_id: message.ping_event.event_id }));
+      if (message.type === 'client_tool_call' && message.client_tool_call?.tool_call_id) {
+        const call = message.client_tool_call as { tool_name?: string; tool_call_id: string; parameters?: Record<string, unknown> };
+        const reply = (result: string, isError: boolean) => { if (agent.readyState === WebSocket.OPEN) agent.send(JSON.stringify({ type: 'client_tool_result', tool_call_id: call.tool_call_id, result, is_error: isError })); };
+        const handle = session.options.onToolCall;
+        if (!handle) reply('Ferramenta indisponível.', true);
+        else void Promise.race([handle(String(call.tool_name ?? ''), call.parameters ?? {}), new Promise<string>((_, reject) => setTimeout(() => reject(new Error('timeout')), /^(consultar|registrar)_/.test(String(call.tool_name ?? '')) ? 15000 : 4000))])
+          .then(result => reply(result, false)).catch(() => reply('Não foi possível salvar agora; siga a conversa normalmente.', true));
+      }
       if (message.type === 'interruption') {
         try { session.options.onFlush?.(); } catch { /* escuta nunca derruba a ligação */ }
         if (session.browserSocket?.readyState === WebSocket.OPEN) session.browserSocket.send(JSON.stringify({ type: 'interruption' }));

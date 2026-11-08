@@ -1,4 +1,4 @@
-import type { Brain, Call, ConnectionDetails, IntegrationStatus, Result } from './types'
+import type { Brain, Call, ConnectionDetails, Contact, ImportReport, IntegrationStatus, MessageTemplate, Result, WhatsappMessage, WhatsappStatus, AmeiStatus, ConfirmOptions, ConfirmRow } from './types'
 
 export const apiBase = import.meta.env.VITE_API_BASE_URL || ''
 
@@ -38,6 +38,31 @@ export const api = {
   openCvortex: () => request<{ opening: boolean }>('/api/connections/cvortex/open', { method: 'POST' }),
   connectElevenLabs: (apiKey: string) => request<ConnectionDetails>('/api/connections/elevenlabs', { method: 'PUT', body: JSON.stringify({ apiKey }) }),
   disconnectElevenLabs: () => request<ConnectionDetails>('/api/connections/elevenlabs', { method: 'DELETE' }),
+  contacts: async () => (await request<{ contacts: Contact[] }>('/api/contacts')).contacts,
+  createContact: async (values: { name: string; phone: string; notes: string | null }) => (await request<{ contact: Contact }>('/api/contacts', { method: 'POST', body: JSON.stringify(values) })).contact,
+  updateContact: async (id: string, patch: { name?: string; phone?: string; notes?: string | null; doNotContact?: boolean }) => (await request<{ contact: Contact }>(`/api/contacts/${id}`, { method: 'PATCH', body: JSON.stringify(patch) })).contact,
+  deleteContact: (id: string) => request<unknown>(`/api/contacts/${id}`, { method: 'DELETE' }),
+  importContacts: (rows: { name: string; phone: string }[]) => request<ImportReport>('/api/contacts/import', { method: 'POST', body: JSON.stringify({ rows }) }),
+  templates: async () => (await request<{ templates: MessageTemplate[] }>('/api/automations/templates')).templates,
+  createTemplate: async (values: { name: string; whenToUse: string; body: string; isActive: boolean }) => (await request<{ template: MessageTemplate }>('/api/automations/templates', { method: 'POST', body: JSON.stringify(values) })).template,
+  updateTemplate: async (id: string, patch: { name?: string; whenToUse?: string; body?: string; isActive?: boolean }) => (await request<{ template: MessageTemplate }>(`/api/automations/templates/${id}`, { method: 'PATCH', body: JSON.stringify(patch) })).template,
+  deleteTemplate: (id: string) => request<unknown>(`/api/automations/templates/${id}`, { method: 'DELETE' }),
+  whatsappStatus: () => request<WhatsappStatus>('/api/whatsapp/status'),
+  confirmOptions: () => request<ConfirmOptions>('/api/amei/confirm/options'),
+  confirmProfessionals: async (specialtyId: string) => (await request<{ professionals: { id: string; name: string }[] }>(`/api/amei/confirm/professionals?specialtyId=${encodeURIComponent(specialtyId)}`)).professionals,
+  confirmList: (filters: { dateInit: string; dateFinish: string; statusId: number; specialtyId?: string; professionalId?: string }) => {
+    const query = new URLSearchParams({ dateInit: filters.dateInit, dateFinish: filters.dateFinish, statusId: String(filters.statusId) })
+    if (filters.specialtyId) query.set('specialtyId', filters.specialtyId)
+    if (filters.professionalId) query.set('professionalId', filters.professionalId)
+    return request<{ rows: ConfirmRow[]; total: number }>(`/api/amei/confirm/list?${query}`)
+  },
+  confirmCall: async (brainId: string, appointmentId: string) => (await request<{ success: true; call: Call }>('/api/amei/confirm/call', { method: 'POST', body: JSON.stringify({ brainId, appointmentId }) })).call,
+  confirmTest: async (brainId: string, body: { phone: string; patientName: string; professional: string; specialty: string; date: string; time: string; valor: string }) => (await request<{ success: true; call: Call }>('/api/amei/confirm/test', { method: 'POST', body: JSON.stringify({ brainId, ...body }) })).call,
+  ameiStatus: () => request<AmeiStatus>('/api/amei/status'),
+  openAmei: () => request<{ opening: boolean }>('/api/amei/open', { method: 'POST' }),
+  openWhatsapp: () => request<{ opening: boolean }>('/api/whatsapp/open', { method: 'POST' }),
+  whatsappMessages: async () => (await request<{ messages: WhatsappMessage[] }>('/api/whatsapp/messages')).messages,
+  testWhatsapp: (templateId: string, phone: string) => request<{ queued: boolean }>('/api/whatsapp/test', { method: 'POST', body: JSON.stringify({ templateId, phone }) }),
   session: () => request<{ authenticated: boolean }>('/api/auth/session'),
   login: (password: string) => request<unknown>('/api/auth/login', { method: 'POST', body: JSON.stringify({ password }) }),
   logout: () => request<unknown>('/api/auth/logout', { method: 'POST' }),

@@ -77,6 +77,8 @@ test('serviço cVortex: estados monotônicos, persistência adiada e discagem am
   try {
     const service = await import('../src/services.js');
     const { CvortexAmbiguousStartError, setCvortexProviderForTests } = await import('../src/cvortex-provider.js');
+    (await import('../src/whatsapp.js')).setWhatsappForTests({ status: async () => ({ browserOpen: false, loggedIn: false, qrVisible: false, busy: false }), open: async () => undefined, send: async () => undefined });
+    (await import('../src/amei.js')).setAmeiForTests({ status: async () => ({ browserOpen: false, loggedIn: false }), open: async () => undefined, put: async () => { throw new Error('AMEI fora do teste'); }, get: async () => { throw new Error('AMEI fora do teste'); } });
     setCvortexProviderForTests({
       ready: async () => true,
       start: async options => { startCount++; lastContactContext = options.contactContext; if (ambiguous) throw new CvortexAmbiguousStartError(); confirmEnded = () => { void options.onEnded?.('completed'); }; connectAgent = () => { void options.onAgentConnected?.(); }; },

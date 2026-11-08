@@ -12,3 +12,15 @@ export interface Call {
   durationSeconds: number | null; result: CallResult | null; transferRequested: boolean;
   summary: Record<string, unknown> | null; metadata: Record<string, unknown> | null; createdAt: string;
 }
+
+export type ContactSource = 'manual' | 'planilha' | 'cartao_de_todos' | 'ligacao';
+export interface Contact {
+  id: string; name: string; phone: string; doNotContact: boolean; source: ContactSource;
+  notes: string | null; createdAt: string; lastCallAt: string | null; lastResult: CallResult | null; callCount: number;
+}
+
+export interface MessageTemplate { id: string; slug: string; name: string; whenToUse: string; body: string; isActive: boolean }
+export interface WhatsappMessage {
+  id: string; callId: string | null; templateSlug: string | null; patientName: string | null; phone: string; body: string;
+  source: 'ia' | 'teste'; status: 'queued' | 'sent' | 'failed'; error: string | null; createdAt: string; sentAt: string | null;
+}

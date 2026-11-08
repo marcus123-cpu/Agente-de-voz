@@ -5,3 +5,12 @@ export interface Call { id: string; brainId: string; patientName: string; phone:
 export interface IntegrationStatus { cvortex: boolean; elevenlabs: boolean; database: boolean; n8n: boolean; liveMonitoring: boolean; browserTakeover: boolean }
 export interface ConnectionDetails { cvortex: { browserOpen: boolean; loggedIn: boolean; activeCall: boolean }; elevenlabs: { keyConfigured: boolean; keyValid: boolean | null; agentId: string | null } }
 export type Result = 'interested' | 'not_interested' | 'callback' | 'do_not_contact' | 'unknown'
+
+export interface Contact { id: string; name: string; phone: string; doNotContact: boolean; source: 'manual' | 'planilha' | 'cartao_de_todos' | 'ligacao'; notes: string | null; createdAt: string; lastCallAt: string | null; lastResult: Result | null; callCount: number }
+export interface ImportReport { imported: number; duplicates: number; invalid: { line: number; reason: string }[]; invalidCount: number }
+export interface MessageTemplate { id: string; slug: string; name: string; whenToUse: string; body: string; isActive: boolean }
+export interface WhatsappMessage { id: string; callId: string | null; templateSlug: string | null; patientName: string | null; phone: string; body: string; source: 'ia' | 'teste'; status: 'queued' | 'sent' | 'failed'; error: string | null; createdAt: string; sentAt: string | null }
+export interface ConfirmRow { appointmentId: string; date: string; time: string; patientName: string; patientSocial: string; age: number | null; phone: string; professional: string; specialty: string; procedure: string; value: string; status: string; statusId: number; channel: string; note: string }
+export interface ConfirmOptions { specialties: { id: string; name: string }[]; statuses: { id: number; name: string }[] }
+export interface AmeiStatus { browserOpen: boolean; loggedIn: boolean; user?: string }
+export interface WhatsappStatus { browserOpen: boolean; loggedIn: boolean; qrVisible: boolean; busy: boolean }

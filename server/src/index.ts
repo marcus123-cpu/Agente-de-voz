@@ -9,9 +9,11 @@ import { clearSession, hasSession, passwordMatches, requireSession, setSession }
 import * as repo from './repository.js';
 import { CallEventsService } from './monitor.js';
 import { cvortexConnectionStatus, cvortexReady, openCvortexBrowser } from './cvortex-provider.js';
+import { openWhatsapp, whatsappStatus } from './whatsapp.js';
+import { ameiStatus, openAmei, ameiConfirmList, ameiConfirmOptions, ameiProfessionalsOf, AmeiError } from './amei.js';
 import { connectElevenLabs, connectionDetails, disconnectElevenLabs } from './connections.js';
-import { PublicError, endCall, getManagedCall, getManagedCallByConversationId, listManagedCalls, saveResult, startCall, syncCall, takeoverCall, updateStatus } from './services.js';
-import type { CallResult } from './types.js';
+import { PublicError, startConfirmationCall, startTestConfirmationCall, normalizePhone, sendTestWhatsapp, endCall, getManagedCall, getManagedCallByConversationId, listManagedCalls, saveResult, startCall, syncCall, takeoverCall, updateStatus } from './services.js';
+import type { CallResult, ContactSource } from './types.js';
 
 const app=express();
 app.disable('x-powered-by');
@@ -59,6 +61,18 @@ app.post('/api/webhooks/elevenlabs',express.raw({type:'application/json',limit:'
 }));
 
 app.use('/api',requireSession);
+app.post('/api/contacts/import',express.json({limit:'2mb'}),wrap(async(req,res)=>{
+  const {rows}=req.body as {rows?:unknown};
+  if(!Array.isArray(rows)||rows.length===0||rows.length>5000)throw new PublicError(400,'Envie de 1 a 5000 linhas.');
+  const valid=new Map<string,{name:string;phone:string;source:ContactSource}>();const invalid:{line:number;reason:string}[]=[];
+  rows.forEach((row:unknown,index:number)=>{
+    const r=row as {name?:unknown;phone?:unknown};
+    try{if(typeof r?.phone!=='string')throw new Error('sem telefone');const phone=normalizePhone(r.phone);const name=typeof r.name==='string'&&r.name.trim()?cleanName(r.name):'Sem nome';valid.set(phone,{name,phone,source:'planilha'});}
+    catch{invalid.push({line:index+1,reason:'telefone ou nome inválido'});}
+  });
+  const imported=await repo.importContacts([...valid.values()]);
+  res.json({imported,duplicates:valid.size-imported,invalid:invalid.slice(0,50),invalidCount:invalid.length});
+}));
 app.use('/api',express.json({limit:'64kb'}));
 app.use('/api',rateLimit({windowMs:60*1000,limit:120,standardHeaders:'draft-7',legacyHeaders:false}));
 app.get('/api/connections',wrap(async(_req,res)=>{res.json(await connectionDetails());}));
@@ -107,10 +121,83 @@ app.patch('/api/brains/:id',wrap(async(req,res)=>{
   }
   res.json({brain:await repo.updateBrain(idParam(req),fields)});
 }));
+const contactSources=['manual','planilha','cartao_de_todos','ligacao'] as const;
+function cleanName(value:unknown):string { const name=typeof value==='string'?value.trim().replace(/\s+/g,' '):''; if(!name||name.length>120)throw new PublicError(400,'Informe um nome de até 120 caracteres.'); return name; }
+function cleanSource(value:unknown,fallback:ContactSource='manual'):ContactSource { if(value===undefined)return fallback; if(typeof value==='string'&&(contactSources as readonly string[]).includes(value))return value as ContactSource; throw new PublicError(400,'Origem inválida.'); }
+app.get('/api/contacts',wrap(async(_req,res)=>{res.json({contacts:await repo.listContacts()});}));
+app.post('/api/contacts',wrap(async(req,res)=>{
+  const {name,phone,source,notes}=req.body as {name?:unknown;phone?:unknown;source?:unknown;notes?:unknown};
+  if(typeof phone!=='string')throw new PublicError(400,'Informe o telefone.');
+  if(notes!==undefined&&notes!==null&&(typeof notes!=='string'||notes.length>4000))throw new PublicError(400,'Observação muito longa (máx. 4000).');
+  try{res.status(201).json({contact:await repo.createContact({name:cleanName(name),phone:normalizePhone(phone),source:cleanSource(source),notes:typeof notes==='string'&&notes.trim()?notes.trim():null})});}
+  catch(e){if(e instanceof Error&&e.message==='DUPLICADO')throw new PublicError(409,'Esse telefone já está nos contatos.');throw e;}
+}));
+app.patch('/api/contacts/:id',wrap(async(req,res)=>{
+  const body=req.body as {name?:unknown;phone?:unknown;notes?:unknown;doNotContact?:unknown};
+  const changes:Record<string,unknown>={};
+  if(body.name!==undefined)changes.name=cleanName(body.name);
+  if(body.phone!==undefined){if(typeof body.phone!=='string')throw new PublicError(400,'Telefone inválido.');changes.phone=normalizePhone(body.phone);}
+  if(body.notes!==undefined){if(body.notes!==null&&(typeof body.notes!=='string'||body.notes.length>4000))throw new PublicError(400,'Observação inválida.');changes.notes=typeof body.notes==='string'&&body.notes.trim()?body.notes.trim():null;}
+  if(body.doNotContact!==undefined){if(typeof body.doNotContact!=='boolean')throw new PublicError(400,'Valor inválido.');changes.do_not_contact=body.doNotContact;}
+  if(!Object.keys(changes).length)throw new PublicError(400,'Nada para alterar.');
+  res.json({contact:await repo.updateContact(idParam(req),changes)});
+}));
+app.delete('/api/contacts/:id',wrap(async(req,res)=>{await repo.deleteContact(idParam(req));res.json({deleted:true});}));
+function slugify(value:string):string { return value.normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase().replace(/[^a-z0-9]+/g,'_').replace(/^_+|_+$/g,'').slice(0,40); }
+function cleanTemplateText(value:unknown,label:string,min:number,max:number):string { const text=typeof value==='string'?value.replace(/\r\n/g,'\n').trim():''; if(text.length<min||text.length>max)throw new PublicError(400,`${label}: use de ${min} a ${max} caracteres.`); return text; }
+app.get('/api/automations/templates',wrap(async(_req,res)=>{res.json({templates:await repo.listTemplates()});}));
+app.post('/api/automations/templates',wrap(async(req,res)=>{
+  const b=req.body as {name?:unknown;whenToUse?:unknown;body?:unknown;isActive?:unknown};
+  const name=cleanTemplateText(b.name,'Nome',2,80);
+  const slug=slugify(name); if(slug.length<2)throw new PublicError(400,'Nome inválido.');
+  try{res.status(201).json({template:await repo.createTemplate({slug,name,when_to_use:b.whenToUse===undefined||b.whenToUse===''?'':cleanTemplateText(b.whenToUse,'Quando usar',0,300),body:cleanTemplateText(b.body,'Mensagem',2,1500),is_active:b.isActive!==false})});}
+  catch(e){if(e instanceof Error&&e.message==='DUPLICADO')throw new PublicError(409,'Já existe um modelo com esse nome.');throw e;}
+}));
+app.patch('/api/automations/templates/:id',wrap(async(req,res)=>{
+  const b=req.body as {name?:unknown;whenToUse?:unknown;body?:unknown;isActive?:unknown};
+  const changes:Record<string,unknown>={};
+  if(b.name!==undefined)changes.name=cleanTemplateText(b.name,'Nome',2,80);
+  if(b.whenToUse!==undefined)changes.when_to_use=b.whenToUse===''?'':cleanTemplateText(b.whenToUse,'Quando usar',0,300);
+  if(b.body!==undefined)changes.body=cleanTemplateText(b.body,'Mensagem',2,1500);
+  if(b.isActive!==undefined){if(typeof b.isActive!=='boolean')throw new PublicError(400,'Valor inválido.');changes.is_active=b.isActive;}
+  if(!Object.keys(changes).length)throw new PublicError(400,'Nada para alterar.');
+  res.json({template:await repo.updateTemplate(idParam(req),changes)});
+}));
+app.delete('/api/automations/templates/:id',wrap(async(req,res)=>{await repo.deleteTemplate(idParam(req));res.json({deleted:true});}));
+app.get('/api/whatsapp/status',wrap(async(_req,res)=>{res.json(await whatsappStatus());}));
+app.get('/api/amei/status',wrap(async(_req,res)=>{res.json(await ameiStatus());}));
+const amei=<T,>(load:()=>Promise<T>)=>load().catch((error:unknown)=>{throw error instanceof AmeiError?new PublicError(503,error.message):error;});
+const queryText=(value:unknown):string|undefined=>typeof value==='string'&&value.trim()?value.trim().slice(0,40):undefined;
+app.get('/api/amei/confirm/options',wrap(async(_req,res)=>{res.json(await amei(()=>ameiConfirmOptions()));}));
+app.get('/api/amei/confirm/professionals',wrap(async(req,res)=>{res.json({professionals:await amei(()=>ameiProfessionalsOf(queryText(req.query.specialtyId)??''))});}));
+app.get('/api/amei/confirm/list',wrap(async(req,res)=>{
+  const statusId=Number(queryText(req.query.statusId));
+  res.json(await amei(()=>ameiConfirmList({dateInit:queryText(req.query.dateInit)??'',dateFinish:queryText(req.query.dateFinish)??'',statusId:Number.isInteger(statusId)&&statusId>0?statusId:undefined,specialtyId:queryText(req.query.specialtyId),professionalId:queryText(req.query.professionalId)})));
+}));
+app.post('/api/amei/confirm/call',wrap(async(req,res)=>{
+  const {brainId,appointmentId}=req.body as {brainId?:string;appointmentId?:string};
+  if(!brainId||!appointmentId)throw new PublicError(400,'Informe a consulta.');
+  const call=await startConfirmationCall(brainId,String(appointmentId));res.status(201).json({success:true,call});
+}));
+app.post('/api/amei/confirm/test',wrap(async(req,res)=>{
+  const b=req.body as {brainId?:string;phone?:string;patientName?:string;professional?:string;specialty?:string;date?:string;time?:string;valor?:string};
+  if(!b.brainId)throw new PublicError(400,'Selecione um cérebro.');
+  const call=await startTestConfirmationCall(b.brainId,{phone:String(b.phone??''),patientName:String(b.patientName??''),professional:String(b.professional??''),specialty:String(b.specialty??''),date:String(b.date??''),time:String(b.time??''),valor:b.valor==null?undefined:String(b.valor)});
+  res.status(201).json({success:true,call});
+}));
+app.post('/api/amei/open',wrap(async(_req,res)=>{try{await openAmei();res.json({opening:true});}catch(e){throw new PublicError(503,e instanceof Error?e.message:'Não foi possível abrir a AMEI.');}}));
+app.post('/api/whatsapp/open',wrap(async(_req,res)=>{await openWhatsapp();res.json({opening:true});}));
+app.get('/api/whatsapp/messages',wrap(async(_req,res)=>{res.json({messages:await repo.listMessages(100)});}));
+app.post('/api/whatsapp/test',wrap(async(req,res)=>{
+  const {templateId,phone}=req.body as {templateId?:unknown;phone?:unknown};
+  if(typeof templateId!=='string'||typeof phone!=='string')throw new PublicError(400,'Informe o modelo e o telefone.');
+  await sendTestWhatsapp(phone,templateId);res.json({queued:true});
+}));
 app.get('/api/calls',wrap(async(_req,res)=>{res.json({calls:await listManagedCalls()});}));
 app.post('/api/calls',wrap(async(req,res)=>{
   const {brainId,patientName,phone,contactContext='not_informed'}=req.body as {brainId?:string;patientName?:string;phone?:string;contactContext?:'not_informed'|'recent_card_member'};
   if(typeof brainId!=='string'||typeof patientName!=='string'||typeof phone!=='string')throw new PublicError(400,'Informe cérebro, nome e telefone.');
+  if(contactContext!=='not_informed'&&contactContext!=='recent_card_member')throw new PublicError(400,'Origem do contato inválida. Confirmações de consulta são feitas pela tela Confirmar agenda.');
   const call=await startCall(brainId,patientName,phone,contactContext);res.status(201).json({success:true,call});
 }));
 app.get('/api/calls/:id',wrap(async(req,res)=>{res.json({call:await syncCall(requireCall(await getManagedCall(idParam(req))))});}));
