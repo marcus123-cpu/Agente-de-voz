@@ -132,3 +132,61 @@ test('AMEI aquecimento: depois de aquecer, a consulta sai do cache; refresh for�
   delete process.env.AMEI_WARM_SPECIALTIES;
   setAmeiForTests({ status: async () => ({ browserOpen: false, loggedIn: false }), open: async () => undefined, put: async () => { throw new Error('x'); }, get: async () => { throw new Error('x'); } });
 });
+
+test('AMEI faltosos: lista junta 3 status só do passado, e a lista de espera não duplica, confere e valida', async () => {
+  const { ameiConfirmList, ameiMissedContext, ameiAddToWaitlist, STATUS_FALTOSOS } = await import('../src/amei.js');
+  const past = brDate(-2).iso, future = brDate(3).iso;
+  const urls: string[] = [];
+  const posts: Array<{ path: string; body: Record<string, unknown> }> = [];
+  let waitlist: Array<Record<string, unknown>> = [{ id: 1, pacienteId: { id: 555 }, especialidadeId: { id: 9 }, statusId: { description: 'pendente' } }];
+  let status = 17, patientId = 321, cpf = '12345678909', postWorks = true;
+  setAmeiForTests({
+    async status() { return { browserOpen: true, loggedIn: true }; },
+    async open() { /* nada */ },
+    async put() { return null as never; },
+    async post<T>(path: string, body: unknown): Promise<T> { posts.push({ path, body: body as Record<string, unknown> }); if (postWorks) waitlist = [...waitlist, { id: 2, pacienteId: { id: patientId }, especialidadeId: { id: 9 }, statusId: { description: 'pendente' } }]; return null as T; },
+    async get<T>(path: string): Promise<T> {
+      urls.push(path);
+      if (path.startsWith('/api/v1/appointments/confirm/status?')) return { meta: { totalItems: 3 }, items: [
+        { agendamentoId: 11, dataHoraInicio: `${past} 08:00`, pacienteNome: 'A', pacienteCelular: '17900000001', status: 'Não compareceu', statusId: 17, especialidade: 'Dermatologia' },
+        { agendamentoId: 12, dataHoraInicio: `${past} 09:00`, pacienteNome: 'B', pacienteCelular: '17900000002', status: 'Desmarcado pelo paciente', statusId: 9, especialidade: 'Dermatologia' },
+        { agendamentoId: 13, dataHoraInicio: `${future} 09:00`, pacienteNome: 'C', pacienteCelular: '17900000003', status: 'Desmarcado pelo paciente', statusId: 9, especialidade: 'Dermatologia' },
+      ] } as T;
+      if (path === '/api/v1/appointments/11') return { id: 11, clinica: 1795, data: past, horaInicio: '08:00', statusAgendamento: status, valorTotal: 40, pacienteId: { id: patientId, nome: 'CARLOS', sobrenome: 'DE TESTE', celular: '17900000001', cpf }, profissionalId: { id: 70, nome: 'ANA', sobrenome: 'EXEMPLO' }, especialidadeId: { id: 9, descricao: 'Dermatologia' } } as T;
+      if (path === '/api/v1/profissionais/especialidade/9') return [{ id: 70, tratamento: 'Dra.' }] as T;
+      if (path.startsWith('/api/v1/lista-espera?')) return { items: waitlist, meta: { totalItems: waitlist.length } } as T;
+      throw new Error('rota inesperada ' + path);
+    },
+  });
+
+  const list = await ameiConfirmList({ dateInit: brDate(-3).iso, dateFinish: brDate(4).iso, statusId: STATUS_FALTOSOS });
+  assert.match(urls[0]!, /statusAppointmentId=3&statusAppointmentId=9&statusAppointmentId=17/, 'os três status juntos');
+  assert.deepEqual(list.rows.map(r => r.appointmentId), ['11', '12'], 'só consultas que já passaram');
+
+  const ctx = await ameiMissedContext('11');
+  assert.equal(ctx.kind, 'missed'); assert.equal(ctx.professional, 'Dra. Ana Exemplo'); assert.equal(ctx.patientId, '321'); assert.equal(ctx.specialtyId, '9');
+  assert.ok(!JSON.stringify(ctx).includes(cpf), 'o CPF não vai no contexto (que é salvo na ligação)');
+  status = 2;
+  await assert.rejects(() => ameiMissedContext('11'), /não está mais como não compareceu/);
+  status = 17;
+
+  // grava na lista de espera com os campos certos e observação da IA
+  assert.match(await ameiAddToWaitlist(ctx, 'mãe passou mal'), /colocado na lista de espera/);
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0]!.path, '/api/v1/lista-espera');
+  assert.deepEqual({ ...posts[0]!.body, observacoes: undefined }, { cpf, pacienteId: 321, especialidadeId: 9, profissionalId: 70, observacoes: undefined });
+  assert.match(String(posts[0]!.body.observacoes), /^Assistente virtual Giovana \(IA\): mãe passou mal/);
+  // já está pendente: não duplica
+  assert.match(await ameiAddToWaitlist(ctx, 'de novo'), /já estava/);
+  assert.equal(posts.length, 1, 'não gravou de novo');
+  // AMEI não registrou: erro, nunca "sucesso"
+  waitlist = []; postWorks = false;
+  await assert.rejects(() => ameiAddToWaitlist(ctx, 'x'), /não confirmou a inclusão/);
+  // paciente mudou / sem CPF / contexto de teste
+  waitlist = []; postWorks = true; patientId = 999;
+  await assert.rejects(() => ameiAddToWaitlist(ctx, 'x'), /mudou de paciente/);
+  patientId = 321; cpf = '123';
+  await assert.rejects(() => ameiAddToWaitlist(ctx, 'x'), /sem CPF válido/);
+  await assert.rejects(() => ameiAddToWaitlist({ ...ctx, kind: 'confirm' }, 'x'), /não tem uma consulta perdida/);
+  setAmeiForTests({ status: async () => ({ browserOpen: false, loggedIn: false }), open: async () => undefined, put: async () => { throw new Error('x'); }, post: async () => { throw new Error('x'); }, get: async () => { throw new Error('x'); } });
+});

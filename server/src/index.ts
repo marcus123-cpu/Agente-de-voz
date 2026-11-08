@@ -12,7 +12,7 @@ import { cvortexConnectionStatus, cvortexReady, openCvortexBrowser } from './cvo
 import { openWhatsapp, whatsappStatus } from './whatsapp.js';
 import { ameiStatus, openAmei, ameiConfirmList, ameiConfirmOptions, ameiProfessionalsOf, AmeiError } from './amei.js';
 import { connectElevenLabs, connectionDetails, disconnectElevenLabs } from './connections.js';
-import { PublicError, startConfirmationCall, startTestConfirmationCall, normalizePhone, sendTestWhatsapp, endCall, getManagedCall, getManagedCallByConversationId, listManagedCalls, saveResult, startCall, syncCall, takeoverCall, updateStatus } from './services.js';
+import { PublicError, startConfirmationCall, startTestConfirmationCall, startMissedCall, startTestMissedCall, normalizePhone, sendTestWhatsapp, endCall, getManagedCall, getManagedCallByConversationId, listManagedCalls, saveResult, startCall, syncCall, takeoverCall, updateStatus } from './services.js';
 import type { CallResult, ContactSource } from './types.js';
 
 const app=express();
@@ -172,16 +172,22 @@ app.get('/api/amei/confirm/options',wrap(async(_req,res)=>{res.json(await amei((
 app.get('/api/amei/confirm/professionals',wrap(async(req,res)=>{res.json({professionals:await amei(()=>ameiProfessionalsOf(queryText(req.query.specialtyId)??''))});}));
 app.get('/api/amei/confirm/list',wrap(async(req,res)=>{
   const statusId=Number(queryText(req.query.statusId));
-  res.json(await amei(()=>ameiConfirmList({dateInit:queryText(req.query.dateInit)??'',dateFinish:queryText(req.query.dateFinish)??'',statusId:Number.isInteger(statusId)&&statusId>0?statusId:undefined,specialtyId:queryText(req.query.specialtyId),professionalId:queryText(req.query.professionalId)})));
+  res.json(await amei(()=>ameiConfirmList({dateInit:queryText(req.query.dateInit)??'',dateFinish:queryText(req.query.dateFinish)??'',statusId:Number.isInteger(statusId)&&(statusId>0||statusId===-1)?statusId:undefined,specialtyId:queryText(req.query.specialtyId),professionalId:queryText(req.query.professionalId)})));
 }));
 app.post('/api/amei/confirm/call',wrap(async(req,res)=>{
   const {brainId,appointmentId}=req.body as {brainId?:string;appointmentId?:string};
   if(!brainId||!appointmentId)throw new PublicError(400,'Informe a consulta.');
   const call=await startConfirmationCall(brainId,String(appointmentId));res.status(201).json({success:true,call});
 }));
+app.post('/api/amei/missed/call',wrap(async(req,res)=>{
+  const {brainId,appointmentId}=req.body as {brainId?:string;appointmentId?:string};
+  if(!brainId||!appointmentId)throw new PublicError(400,'Informe a consulta.');
+  const call=await startMissedCall(brainId,String(appointmentId));res.status(201).json({success:true,call});
+}));
 app.post('/api/amei/confirm/test',wrap(async(req,res)=>{
-  const b=req.body as {brainId?:string;phone?:string;patientName?:string;professional?:string;specialty?:string;date?:string;time?:string;valor?:string};
+  const b=req.body as {kind?:string;situation?:string;brainId?:string;phone?:string;patientName?:string;professional?:string;specialty?:string;date?:string;time?:string;valor?:string};
   if(!b.brainId)throw new PublicError(400,'Selecione um cérebro.');
+  if(b.kind==='missed'){const call=await startTestMissedCall(b.brainId,{phone:String(b.phone??''),patientName:String(b.patientName??''),professional:String(b.professional??''),specialty:String(b.specialty??''),date:String(b.date??''),time:String(b.time??''),situation:String(b.situation??'faltou')});res.status(201).json({success:true,call});return;}
   const call=await startTestConfirmationCall(b.brainId,{phone:String(b.phone??''),patientName:String(b.patientName??''),professional:String(b.professional??''),specialty:String(b.specialty??''),date:String(b.date??''),time:String(b.time??''),valor:b.valor==null?undefined:String(b.valor)});
   res.status(201).json({success:true,call});
 }));

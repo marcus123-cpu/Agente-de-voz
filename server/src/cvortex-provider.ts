@@ -28,7 +28,7 @@ export interface CvortexStartOptions {
   callId: string;
   phone: string;
   patientName: string;
-  contactContext: 'not_informed' | 'recent_card_member' | 'appointment_confirmation';
+  contactContext: 'not_informed' | 'recent_card_member' | 'appointment_confirmation' | 'missed_appointment';
   agentId: string;
   /** Modelos de WhatsApp que a IA pode enviar (vira a variável {{modelos_whatsapp}} do prompt). */
   whatsappModels?: string;

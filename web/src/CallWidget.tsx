@@ -6,7 +6,7 @@ const statusText: Record<CallStatus, string> = { idle: 'Aguardando', connecting:
 const finished: CallStatus[] = ['completed', 'failed', 'busy', 'no_answer', 'canceled']
 const weekdays = ['dom', 'seg', 'ter', 'qua', 'qui', 'sex', 'sáb']
 
-interface AppointmentMeta { date?: string; time?: string; specialty?: string; professional?: string; test?: boolean }
+interface AppointmentMeta { date?: string; time?: string; specialty?: string; professional?: string; test?: boolean; kind?: string }
 function dayLabel(iso?: string) {
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso ?? '')
   return m ? `${weekdays[new Date(Date.UTC(+m[1]!, +m[2]! - 1, +m[3]!)).getUTCDay()]} ${m[3]}/${m[2]}` : ''
@@ -26,15 +26,22 @@ export function CallWidget({ call, elapsed, onOpen, onClose, onRefresh }: { call
 
   const appointment = (call.metadata?.appointment ?? null) as AppointmentMeta | null
   const outcome = (call.metadata?.confirmation as { outcome?: string } | undefined)?.outcome
+  const missed = (call.metadata?.missed as { outcome?: string } | undefined)?.outcome
+  const isMissed = appointment?.kind === 'missed'
   const human = Boolean(call.metadata?.human_takeover)
   const talking = call.status === 'in_progress'
-  const tone = outcome === 'confirmou' ? 'ok' : outcome === 'desmarcou' ? 'bad' : outcome === 'remarcar' ? 'warn' : done ? 'idle' : talking ? 'live' : 'wait'
+  const tone = outcome === 'confirmou' || missed === 'lista_espera' ? 'ok' : outcome === 'desmarcou' ? 'bad' : outcome === 'remarcar' || missed === 'remarcar_horario' || missed === 'outro_interesse' ? 'warn' : done ? 'idle' : talking ? 'live' : 'wait'
 
-  let result = <span className="cw-result wait"><PhoneCall size={14}/> {talking ? 'Aguardando a resposta do paciente...' : 'Aguardando atender...'}</span>
-  if (outcome === 'confirmou') result = <span className="cw-result ok"><CheckCircle2 size={15}/> Consulta CONFIRMADA{appointment?.test ? ' (teste, nada gravado)' : ''}</span>
+  let result = <span className="cw-result wait"><PhoneCall size={14}/> {talking ? (isMissed ? 'Conversando com o paciente...' : 'Aguardando a resposta do paciente...') : 'Aguardando atender...'}</span>
+  const sim = appointment?.test ? ' (teste, nada gravado)' : ''
+  if (missed === 'lista_espera') result = <span className="cw-result ok"><CheckCircle2 size={15}/> Colocado(a) na LISTA DE ESPERA{sim}</span>
+  else if (missed === 'remarcar_horario') result = <span className="cw-result warn"><RotateCcw size={15}/> Escolheu um horário: assuma e agende</span>
+  else if (missed === 'outro_interesse') result = <span className="cw-result warn"><RotateCcw size={15}/> Tem outro interesse: assuma a ligação</span>
+  else if (missed === 'sem_interesse') result = <span className="cw-result idle"><PhoneOff size={14}/> Sem interesse em remarcar</span>
+  else if (outcome === 'confirmou') result = <span className="cw-result ok"><CheckCircle2 size={15}/> Consulta CONFIRMADA{appointment?.test ? ' (teste, nada gravado)' : ''}</span>
   else if (outcome === 'desmarcou') result = <span className="cw-result bad"><XCircle size={15}/> Consulta DESMARCADA{appointment?.test ? ' (teste, nada gravado)' : ''}</span>
   else if (outcome === 'remarcar') result = <span className="cw-result warn"><RotateCcw size={15}/> Quer remarcar: assuma a ligação</span>
-  else if (done && call.status === 'completed') result = <span className="cw-result idle">Encerrou sem confirmar nem desmarcar</span>
+  else if (done && call.status === 'completed') result = <span className="cw-result idle">{isMissed ? 'Encerrou sem registrar resultado' : 'Encerrou sem confirmar nem desmarcar'}</span>
   else if (done) result = <span className="cw-result idle"><PhoneOff size={14}/> {statusText[call.status]}</span>
 
   return <aside className={`call-widget cw-${tone}`} role="status" aria-live="polite">
@@ -43,6 +50,7 @@ export function CallWidget({ call, elapsed, onOpen, onClose, onRefresh }: { call
       <strong>{statusText[call.status]}</strong>
       {talking && <span className="cw-time">{clock(elapsed)}</span>}
       {human && <span className="cw-badge">Você assumiu</span>}
+      {isMissed && <span className="cw-badge">FALTOSO</span>}
       {appointment?.test && <span className="cw-badge">TESTE</span>}
       <button aria-label="Fechar" onClick={onClose}><X size={15}/></button>
     </header>

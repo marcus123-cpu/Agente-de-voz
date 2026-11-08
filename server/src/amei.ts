@@ -138,34 +138,37 @@ class AmeiProvider {
   }
 
   /** PUT na API da AMEI dentro da página logada (usado só pela confirmação de consultas). */
-  async put<T = unknown>(path: string, body: unknown): Promise<T> {
+  async put<T = unknown>(path: string, body: unknown): Promise<T> { return this.write<T>('PUT', path, body); }
+  async post<T = unknown>(path: string, body: unknown): Promise<T> { return this.write<T>('POST', path, body); }
+
+  private async write<T>(method: 'PUT' | 'POST', path: string, body: unknown): Promise<T> {
     await this.ensureFresh();
     this.inFlight += 1;
-    try { return await this.putNow<T>(path, body); }
+    try { return await this.putNow<T>(method, path, body); }
     catch (error) {
       if (!(error instanceof AmeiAuthError)) throw error;
       this.inFlight -= 1; await this.refresh(true); this.inFlight += 1;
-      return await this.putNow<T>(path, body);
+      return await this.putNow<T>(method, path, body);
     }
     finally { this.inFlight -= 1; }
   }
 
-  private async putNow<T>(path: string, body: unknown): Promise<T> {
+  private async putNow<T>(method: 'PUT' | 'POST', path: string, body: unknown): Promise<T> {
     let page: Page | null;
     try { page = await this.findPage(false); } catch { throw new AmeiError('O navegador do cVortex está fechado. Abra-o e entre na AMEI.'); }
     if (page && !page.url().startsWith(AMEI_ORIGIN)) throw new AmeiAuthError('A sessão da AMEI expirou. Entre de novo pela aba Automações.');
     if (!page) throw new AmeiError('A AMEI não está conectada. Entre na AMEI pela aba Automações.');
-    const result = await page.evaluate(async ({ url, payload }: { url: string; payload: unknown }) => {
+    const result = await page.evaluate(async ({ url, payload, verb }: { url: string; payload: unknown; verb: string }) => {
       try {
-        const response = await fetch(url, { method: 'PUT', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload), signal: AbortSignal.timeout(20000) });
+        const response = await fetch(url, { method: verb, credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload), signal: AbortSignal.timeout(20000) });
         if (response.status === 401 || response.status === 403) return { error: 'auth' as const };
         const text = await response.text();
         let data: unknown = null;
         try { data = JSON.parse(text); } catch { /* resposta sem JSON */ }
-        if (!response.ok) return { error: 'http' as const, status: response.status, message: (data as { mensagem?: string } | null)?.mensagem };
+        if (!response.ok) return { error: 'http' as const, status: response.status, message: (data as { mensagem?: string; message?: string } | null)?.mensagem ?? (data as { message?: string } | null)?.message };
         return { data };
       } catch { return { error: 'network' as const }; }
-    }, { url: path, payload: body });
+    }, { url: path, payload: body, verb: method });
     if ('error' in result) {
       if (result.error === 'auth') throw new AmeiAuthError('A sessão da AMEI expirou. Entre de novo pela aba Automações.');
       if (result.error === 'http') throw new AmeiError(`A AMEI recusou a alteração${result.message ? `: ${result.message}` : ` (HTTP ${result.status})`}.`);
@@ -198,7 +201,7 @@ class AmeiProvider {
   }
 }
 
-export interface AmeiAdapter { status(): Promise<AmeiStatus>; open(): Promise<void>; get<T = unknown>(path: string): Promise<T>; put<T = unknown>(path: string, body: unknown): Promise<T> }
+export interface AmeiAdapter { status(): Promise<AmeiStatus>; open(): Promise<void>; get<T = unknown>(path: string): Promise<T>; put<T = unknown>(path: string, body: unknown): Promise<T>; post<T = unknown>(path: string, body: unknown): Promise<T> }
 let adapter: AmeiAdapter = new AmeiProvider();
 export function setAmeiForTests(value: AmeiAdapter): void { adapter = value; cache.clear(); }
 export const ameiStatus = (): Promise<AmeiStatus> => adapter.status();
@@ -376,7 +379,7 @@ export async function ameiConfirmOptions(): Promise<{ specialties: Array<{ id: s
   const wanted = new Set([2, 16, 9, 8, 17, 18, 5, 3]);
   return {
     specialties: list.map(item => ({ id: String(item.id), name: item.nome })).sort((a, b) => a.name.localeCompare(b.name, 'pt-BR')),
-    statuses: (Array.isArray(statuses) ? statuses : []).filter(item => wanted.has(Number(item.value))).map(item => ({ id: Number(item.value), name: String(item.title) })),
+    statuses: [{ id: STATUS_FALTOSOS, name: 'Faltosos (não compareceu, desmarcou ou cancelado)' }, ...(Array.isArray(statuses) ? statuses : []).filter(item => wanted.has(Number(item.value))).map(item => ({ id: Number(item.value), name: String(item.title) }))],
   };
 }
 export async function ameiProfessionalsOf(specialtyId: string): Promise<Array<{ id: string; name: string }>> {
@@ -390,10 +393,12 @@ export async function ameiConfirmList(filters: ConfirmFilters): Promise<{ rows: 
   if (filters.dateFinish < filters.dateInit) throw new AmeiError('A data fim não pode ser antes da data início.');
   if ((Date.parse(filters.dateFinish) - Date.parse(filters.dateInit)) / 86400000 > 31) throw new AmeiError('Escolha no máximo 31 dias por pesquisa.');
   const statusId = Number.isInteger(filters.statusId) ? Number(filters.statusId) : 2;
+  const statusIds = statusId === STATUS_FALTOSOS ? MISSED_STATUSES : [statusId];
   const rows: ConfirmRow[] = [];
   let total = 0;
   for (let page = 1; page <= 30; page++) {
-    const qs = new URLSearchParams({ dateInit: filters.dateInit.replaceAll('-', ''), dateFinish: filters.dateFinish.replaceAll('-', ''), unitId: CLINIC_ID, statusAppointmentId: String(statusId), page: String(page), limit: '100' });
+    const qs = new URLSearchParams({ dateInit: filters.dateInit.replaceAll('-', ''), dateFinish: filters.dateFinish.replaceAll('-', ''), unitId: CLINIC_ID, page: String(page), limit: '100' });
+    for (const id of statusIds) qs.append('statusAppointmentId', String(id));
     if (filters.specialtyId && /^\d{1,10}$/.test(filters.specialtyId)) qs.set('specialtyId', filters.specialtyId);
     if (filters.professionalId && /^\d{1,10}$/.test(filters.professionalId)) qs.set('professionalId', filters.professionalId);
     const data = await adapter.get<{ items?: Array<Record<string, unknown>>; meta?: { totalItems?: number } }>(`/api/v1/appointments/confirm/status?${qs}`);
@@ -411,18 +416,19 @@ export async function ameiConfirmList(filters: ConfirmFilters): Promise<{ rows: 
     }
     if (rows.length >= total || !data.items.length) break;
   }
+  if (statusId === STATUS_FALTOSOS) { const now = nowBr(); const past = rows.filter(r => `${r.date} ${r.time}` <= `${now.date} ${now.time}`); rows.length = 0; rows.push(...past); total = rows.length; }
   rows.sort((a, b) => (a.date + a.time).localeCompare(b.date + b.time) || a.patientName.localeCompare(b.patientName, 'pt-BR'));
   return { rows, total };
 }
 
 // ─── Contexto de uma consulta (para a ligação de confirmação) ───────────────────────────────────
-export interface AppointmentContext { appointmentId: string; date: string; time: string; patientName: string; phone: string; professional: string; specialty: string; statusId: number; /** valor da consulta na AMEI, ex.: "102" */ valor?: string; /** ligação de teste: nada é gravado na AMEI */ test?: boolean }
+export interface AppointmentContext { appointmentId: string; date: string; time: string; patientName: string; phone: string; professional: string; specialty: string; statusId: number; /** valor da consulta na AMEI, ex.: "102" */ valor?: string; /** ligação de teste: nada é gravado na AMEI */ test?: boolean; /** confirm = consulta a confirmar; missed = consulta perdida (faltoso) */ kind?: 'confirm' | 'missed'; patientId?: string; specialtyId?: string; professionalId?: string }
 const STATUS_AGENDADO = 2, STATUS_CONFIRMADO = 16, STATUS_DESMARCADO_PACIENTE = 9;
 const titleCase = (value: string): string => value.toLocaleLowerCase('pt-BR').replace(/(^|\s)(\p{L})/gu, (_m, space: string, letter: string) => space + letter.toLocaleUpperCase('pt-BR')).replace(/\s(Da|De|Do|Das|Dos|E)(?=\s)/g, m => m.toLowerCase());
 
 interface AppointmentDetail {
   id: number | string; clinica: number | string; data: string; horaInicio: string; statusAgendamento: number; valorTotal?: number | string;
-  pacienteId?: { nome?: string; sobrenome?: string; celular?: string };
+  pacienteId?: { id?: number | string; nome?: string; sobrenome?: string; celular?: string };
   profissionalId?: { id?: number | string; nome?: string; sobrenome?: string };
   especialidadeId?: { id?: number | string; descricao?: string };
 }
@@ -540,4 +546,74 @@ export function startAmeiWarming(): () => void {
   const limit = setTimeout(() => clearInterval(timer), 30 * 60_000);
   limit.unref();
   return () => { clearInterval(timer); clearTimeout(limit); };
+}
+
+// ─── Faltosos: consulta perdida (não compareceu, desmarcou ou cancelada) ─────────────────────────
+export const STATUS_FALTOSOS = -1;
+const MISSED_STATUSES = [3, 9, 17]; // Cancelado, Desmarcado pelo paciente, Não compareceu
+export type MissedSituation = 'faltou' | 'desmarcou' | 'cancelada';
+export const missedSituationOf = (statusId: number): MissedSituation => statusId === 17 ? 'faltou' : statusId === 9 ? 'desmarcou' : 'cancelada';
+
+/** Lê a consulta perdida direto da AMEI e monta o contexto da ligação de recuperação (sem CPF: ele só é lido na hora de gravar). */
+export async function ameiMissedContext(appointmentId: string): Promise<AppointmentContext> {
+  const detail = await appointmentDetail(appointmentId);
+  const date = toIso(detail.data), time = toHour(detail.horaInicio);
+  if (!date || !time) throw new AmeiError('A AMEI devolveu data ou hora inválidas.');
+  const statusId = Number(detail.statusAgendamento);
+  if (!MISSED_STATUSES.includes(statusId)) throw new AmeiError('Essa consulta não está mais como não compareceu, desmarcada ou cancelada; atualize a lista.');
+  const now = nowBr();
+  if (statusId === 17 && `${date} ${time}` > `${now.date} ${now.time}`) throw new AmeiError('Essa consulta ainda não aconteceu.');
+  const patientName = [detail.pacienteId?.nome, detail.pacienteId?.sobrenome].filter(Boolean).join(' ').trim();
+  const phone = digits(detail.pacienteId?.celular);
+  if (!patientName || phone.length < 10) throw new AmeiError('A consulta está sem nome ou celular do paciente.');
+  if (!detail.pacienteId?.id || !detail.especialidadeId?.id) throw new AmeiError('A consulta está sem paciente ou especialidade na AMEI.');
+  let title = '';
+  try { title = (await professionalTitles(detail.especialidadeId.id)).get(String(detail.profissionalId?.id)) ?? ''; } catch { /* sem tratamento */ }
+  const professional = [title, titleCase([detail.profissionalId?.nome, detail.profissionalId?.sobrenome].filter(Boolean).join(' '))].filter(Boolean).join(' ').trim();
+  return {
+    appointmentId, date, time, patientName: titleCase(patientName), phone, professional, specialty: String(detail.especialidadeId.descricao ?? '').trim(), statusId,
+    valor: detail.valorTotal != null && Number(detail.valorTotal) > 0 ? String(detail.valorTotal) : undefined,
+    kind: 'missed', patientId: String(detail.pacienteId.id), specialtyId: String(detail.especialidadeId.id), professionalId: detail.profissionalId?.id != null ? String(detail.profissionalId.id) : undefined,
+  };
+}
+
+// ─── Lista de espera (única outra escrita na AMEI além de confirmar/desmarcar) ──────────────────
+interface WaitlistItem { id: number; pacienteId?: { id?: number }; especialidadeId?: { id?: number }; statusId?: { description?: string } }
+/** Lista de espera inteira (a busca por CPF da AMEI não filtra de verdade), filtrada aqui pelo paciente. */
+async function waitlistOf(patientId: string): Promise<WaitlistItem[]> {
+  const found: WaitlistItem[] = [];
+  let total = Infinity;
+  for (let page = 1; page <= 40 && found.length < total; page++) {
+    const data = await adapter.get<{ items?: WaitlistItem[]; meta?: { totalItems?: number } }>(`/api/v1/lista-espera?page=${page}&limit=100`);
+    if (!Array.isArray(data?.items)) throw new AmeiError('A AMEI devolveu a lista de espera num formato inesperado.');
+    if (!data.items.length) break;
+    total = Number.isInteger(data.meta?.totalItems) ? data.meta!.totalItems! : data.items.length;
+    found.push(...data.items.filter(item => String(item.pacienteId?.id) === patientId));
+    if (page * 100 >= total) break;
+  }
+  return found;
+}
+const isPendingFor = (item: WaitlistItem, patientId: string, specialtyId: string): boolean =>
+  String(item.pacienteId?.id) === patientId && String(item.especialidadeId?.id) === specialtyId && norm(item.statusId?.description) === 'pendente';
+
+/**
+ * Coloca o paciente da consulta perdida na lista de espera da AMEI (CPF, paciente, especialidade, profissional e observação).
+ * Não duplica: se ele já está pendente na mesma especialidade, devolve sucesso sem gravar. Confere depois de gravar.
+ */
+export async function ameiAddToWaitlist(ctx: AppointmentContext, reason: string): Promise<string> {
+  if (ctx.kind !== 'missed' || !ctx.patientId || !ctx.specialtyId) throw new AmeiError('Esta ligação não tem uma consulta perdida para colocar na lista de espera.');
+  const detail = await appointmentDetail(ctx.appointmentId) as AppointmentDetail & { pacienteId?: { id?: number | string; cpf?: string } };
+  if (String(detail.pacienteId?.id) !== ctx.patientId || String(detail.especialidadeId?.id) !== ctx.specialtyId) throw new AmeiError('A consulta mudou de paciente ou especialidade na AMEI; não alterei nada.');
+  return addToWaitlist({ cpf: digits(detail.pacienteId?.cpf), patientId: ctx.patientId, specialtyId: ctx.specialtyId, professionalId: ctx.professionalId, reason });
+}
+
+/** Núcleo da inclusão na lista de espera: valida o CPF, não duplica, grava e confere depois. */
+export async function addToWaitlist(input: { cpf: string; patientId: string; specialtyId: string; professionalId?: string; reason: string }): Promise<string> {
+  const cpf = digits(input.cpf);
+  if (cpf.length !== 11) throw new AmeiError('O paciente está sem CPF válido na AMEI; a equipe precisa incluir na lista de espera.');
+  if ((await waitlistOf(input.patientId)).some(item => isPendingFor(item, input.patientId, input.specialtyId))) return 'Paciente já estava na lista de espera dessa especialidade.';
+  const note = `Assistente virtual Giovana (IA): ${input.reason.replace(/\s+/g, ' ').trim()}`.slice(0, 250);
+  await adapter.post('/api/v1/lista-espera', { cpf, pacienteId: Number(input.patientId), especialidadeId: Number(input.specialtyId), profissionalId: input.professionalId ? Number(input.professionalId) : '', observacoes: note });
+  if (!(await waitlistOf(input.patientId)).some(item => isPendingFor(item, input.patientId, input.specialtyId))) throw new AmeiError('A AMEI não confirmou a inclusão na lista de espera; confira manualmente.');
+  return 'Paciente colocado na lista de espera.';
 }

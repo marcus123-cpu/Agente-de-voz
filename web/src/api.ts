@@ -57,7 +57,8 @@ export const api = {
     return request<{ rows: ConfirmRow[]; total: number }>(`/api/amei/confirm/list?${query}`)
   },
   confirmCall: async (brainId: string, appointmentId: string) => (await request<{ success: true; call: Call }>('/api/amei/confirm/call', { method: 'POST', body: JSON.stringify({ brainId, appointmentId }) })).call,
-  confirmTest: async (brainId: string, body: { phone: string; patientName: string; professional: string; specialty: string; date: string; time: string; valor: string }) => (await request<{ success: true; call: Call }>('/api/amei/confirm/test', { method: 'POST', body: JSON.stringify({ brainId, ...body }) })).call,
+  confirmTest: async (brainId: string, body: { kind?: 'confirm' | 'missed'; situation?: string; phone: string; patientName: string; professional: string; specialty: string; date: string; time: string; valor: string }) => (await request<{ success: true; call: Call }>('/api/amei/confirm/test', { method: 'POST', body: JSON.stringify({ brainId, ...body }) })).call,
+  missedCall: async (brainId: string, appointmentId: string) => (await request<{ success: true; call: Call }>('/api/amei/missed/call', { method: 'POST', body: JSON.stringify({ brainId, appointmentId }) })).call,
   ameiStatus: () => request<AmeiStatus>('/api/amei/status'),
   openAmei: () => request<{ opening: boolean }>('/api/amei/open', { method: 'POST' }),
   openWhatsapp: () => request<{ opening: boolean }>('/api/whatsapp/open', { method: 'POST' }),
