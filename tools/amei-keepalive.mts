@@ -1,0 +1,13 @@
+import { chromium } from 'playwright';
+import { ameiStatus, ameiConfirmList } from '../server/src/amei.ts';
+const b = await chromium.connectOverCDP('http://127.0.0.1:9223');
+const page = b.contexts()[0]!.pages().find(p => p.url().startsWith('https://amei.amorsaude.com.br'))!;
+const origin = () => page.evaluate(() => performance.timeOrigin);
+console.log('1', JSON.stringify(await ameiStatus()));
+const t0 = await origin();
+await new Promise(r => setTimeout(r, 75000));
+const t1 = await origin();
+console.log('aba recarregou sozinha:', t1 !== t0);
+console.log('2', JSON.stringify(await ameiStatus()));
+console.log('lista ok:', (await ameiConfirmList({ dateInit: '2026-11-11', dateFinish: '2026-11-11' })).rows.length);
+process.exit(0);

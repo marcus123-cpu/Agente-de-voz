@@ -1,6 +1,7 @@
 import { useEffect } from 'react'
-import { CheckCircle2, PhoneCall, PhoneOff, RotateCcw, X, XCircle } from 'lucide-react'
+import { CheckCircle2, Hand, PhoneCall, PhoneOff, RotateCcw, X, XCircle } from 'lucide-react'
 import type { Call, CallStatus } from './types'
+import { LiveListen } from './LiveListen'
 
 const statusText: Record<CallStatus, string> = { idle: 'Aguardando', connecting: 'Conectando...', ringing: 'Chamando...', in_progress: 'Em ligação', completed: 'Ligação encerrada', failed: 'Falhou ao ligar', busy: 'Número ocupado', no_answer: 'Não atendeu', canceled: 'Cancelada' }
 const finished: CallStatus[] = ['completed', 'failed', 'busy', 'no_answer', 'canceled']
@@ -15,7 +16,7 @@ function clock(seconds: number) { const s = Math.max(0, seconds); return `${Stri
 function maskPhone(phone: string) { const d = phone.replace(/\D/g, '').replace(/^55/, ''); return d.length >= 10 ? `(${d.slice(0, 2)}) ${d.slice(2, d.length - 4)}-${d.slice(-4)}` : phone }
 
 /** Mini painel flutuante: mostra se a ligação está chamando e se a consulta foi confirmada, sem precisar ouvir. */
-export function CallWidget({ call, elapsed, onOpen, onClose, onRefresh }: { call: Call; elapsed: number; onOpen: () => void; onClose: () => void; onRefresh: () => void }) {
+export function CallWidget({ call, elapsed, demo, ending, takingOver, onTakeover, onEnd, onOpen, onClose, onRefresh }: { call: Call; elapsed: number; demo: boolean; ending: boolean; takingOver: boolean; onTakeover: () => void; onEnd: () => void; onOpen: () => void; onClose: () => void; onRefresh: () => void }) {
   const done = finished.includes(call.status)
   // Depois que a ligação acaba, relê mais duas vezes para pegar o resultado gravado no final.
   useEffect(() => {
@@ -60,6 +61,11 @@ export function CallWidget({ call, elapsed, onOpen, onClose, onRefresh }: { call
       {appointment && <small>{appointment.specialty}{appointment.date ? ` · ${dayLabel(appointment.date)} ${appointment.time ?? ''}` : ''}{appointment.professional ? ` · ${appointment.professional}` : ''}</small>}
       {result}
     </div>
+    {!done && <div className="cw-actions">
+      {!demo && <LiveListen compact callId={call.id} active={!done} humanTakeover={human}/>}
+      <button className="cw-act cw-act-take" disabled={human || takingOver} onClick={onTakeover}><Hand size={13}/>{human ? 'Assumida' : takingOver ? 'Assumindo...' : 'Assumir'}</button>
+      <button className="cw-act cw-act-end" disabled={ending} onClick={onEnd}><PhoneOff size={13}/>{ending ? 'Encerrando...' : 'Encerrar'}</button>
+    </div>}
     <footer><button onClick={onOpen}>Abrir atendimento</button></footer>
   </aside>
 }

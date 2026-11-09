@@ -71,6 +71,7 @@ class AmeiProvider {
       try {
         const page = await this.findPage(false);
         if (!page) return;
+        if (page.url().startsWith('https://id.amorsaude.com.br')) return;   // usuário na tela de login: não mexer na página
         if (page.url().startsWith(AMEI_ORIGIN)) await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
         if (!page.url().startsWith(AMEI_ORIGIN)) await page.goto(`${AMEI_ORIGIN}/home`, { waitUntil: 'domcontentloaded', timeout: 30000 });
         if (page.url().startsWith(AMEI_ORIGIN)) await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => undefined);
@@ -181,7 +182,8 @@ class AmeiProvider {
     try {
       let page = await this.findPage(false);
       if (!page) return { browserOpen: true, loggedIn: false };
-      if (!page.url().startsWith(AMEI_ORIGIN)) {   // aba parada no login: tenta renovar pela Home (SSO) antes de dizer que caiu
+      if (page.url().startsWith('https://id.amorsaude.com.br')) return { browserOpen: true, loggedIn: false };   // no login: não recarregar
+      if (!page.url().startsWith(AMEI_ORIGIN)) {
         await this.refresh(true);
         page = await this.findPage(false);
         if (!page || !page.url().startsWith(AMEI_ORIGIN)) return { browserOpen: true, loggedIn: false };

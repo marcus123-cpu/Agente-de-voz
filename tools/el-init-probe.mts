@@ -1,0 +1,13 @@
+import 'dotenv/config';
+import WebSocket from 'ws';
+const key = process.env.ELEVENLABS_API_KEY!, agent = process.env.ELEVENLABS_AGENT_ID!;
+const r = await fetch(`https://api.elevenlabs.io/v1/convai/conversation/get-signed-url?agent_id=${agent}`, { headers: { 'xi-api-key': key } });
+console.log('signed url', r.status);
+const { signed_url } = await r.json() as { signed_url: string };
+const ws = new WebSocket(signed_url);
+const vars = { patient_name: 'Marcus Paulo', contact_context: process.env.CTX || 'appointment_confirmation', saudacao: 'boa noite', modelos_whatsapp: 'nenhum', agenda_amei: 'conectada', consulta_dia: 'quarta-feira, dia 11 de novembro', consulta_hora: '9 e 10 da manhã', consulta_profissional: 'Dra. Mayara Martins Colturato Minuzzo', consulta_especialidade: 'Clínica médica', consulta_valor: '90 reais' };
+ws.on('open', () => ws.send(JSON.stringify({ type: 'conversation_initiation_client_data', dynamic_variables: vars })));
+ws.on('message', d => { const m = JSON.parse(String(d)); console.log('MSG', m.type, JSON.stringify(m).slice(0, 220)); });
+ws.on('close', (c, reason) => { console.log('CLOSE', c, String(reason)); process.exit(0); });
+ws.on('error', e => console.log('ERR', e.message));
+setTimeout(() => { console.log('timeout ok (sem fechar)'); ws.close(); }, 9000);

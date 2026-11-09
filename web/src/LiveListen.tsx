@@ -17,7 +17,7 @@ function listenUrl(callId: string) {
  * Escuta ao vivo da ligação dentro do painel. O áudio vem do servidor em PCM16
  * 16 kHz (1 byte de origem + amostras) e é tocado só aqui; nada é gravado.
  */
-export function LiveListen({ callId, active, humanTakeover }: { callId: string; active: boolean; humanTakeover: boolean }) {
+export function LiveListen({ callId, active, humanTakeover, compact = false }: { callId: string; active: boolean; humanTakeover: boolean; compact?: boolean }) {
   const [phase, setPhase] = useState<Phase>('idle')
   const [error, setError] = useState('')
   const [volume, setVolume] = useState(1)
@@ -130,6 +130,14 @@ export function LiveListen({ callId, active, humanTakeover }: { callId: string; 
   }, [phase])
 
   const listening = phase === 'on'
+  if (compact) {
+    return <>
+      {listening || phase === 'connecting'
+        ? <button className="cw-act cw-act-on" onClick={stop}><Square size={13}/>Parar de ouvir</button>
+        : <button className="cw-act" disabled={!active || humanTakeover} title={humanTakeover ? 'Você assumiu: o áudio passa pelo webphone' : undefined} onClick={() => void start()}><Headphones size={13}/>Ouvir</button>}
+      {error && <small className="cw-err">{error}</small>}
+    </>
+  }
   return (
     <div className="supervisor-panel">
       <div className="panel-head">

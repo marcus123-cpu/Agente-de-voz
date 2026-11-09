@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Phone, Search } from 'lucide-react'
+import { Phone, RefreshCw, Search } from 'lucide-react'
 import { api } from './api'
 import type { Call, ConfirmOptions, ConfirmRow } from './types'
 
@@ -14,17 +14,21 @@ const statusClass = (id: number) => id === 16 ? 'tag tag-ok' : id === 9 || id ==
 const sizes = [10, 25, 50]
 const MISSED_STATUS = new Set([3, 9, 17])   // cancelado, desmarcado pelo paciente, não compareceu
 
+type Saved = { dateInit: string; dateFinish: string; statusId: number; specialtyId: string; professionalId: string; patient: string; procedure: string; rows: ConfirmRow[] | null; updatedAt: Date | null; last: { dateInit: string; dateFinish: string; statusId: number; specialtyId?: string; professionalId?: string } | null }
+/** Guarda filtros e resultado ao sair da aba, para voltar do jeito que estava. */
+let saved: Saved | null = null
+
 export function ConfirmPanel({ brainId, canCall, onNotice, onStarted, onFailed, outcomeKey }: { brainId: string; canCall: boolean; onNotice: (message: string) => void; onStarted: (call: Call) => void; onFailed: (patientName: string, message: string) => void; outcomeKey: string }) {
   const [options, setOptions] = useState<ConfirmOptions | null>(null)
   const [professionals, setProfessionals] = useState<{ id: string; name: string }[]>([])
-  const [dateInit, setDateInit] = useState(todayBr())
-  const [dateFinish, setDateFinish] = useState(todayBr())
-  const [statusId, setStatusId] = useState(2)
-  const [specialtyId, setSpecialtyId] = useState('')
-  const [professionalId, setProfessionalId] = useState('')
-  const [patient, setPatient] = useState('')
-  const [procedure, setProcedure] = useState('')
-  const [rows, setRows] = useState<ConfirmRow[] | null>(null)
+  const [dateInit, setDateInit] = useState(saved?.dateInit ?? todayBr())
+  const [dateFinish, setDateFinish] = useState(saved?.dateFinish ?? todayBr())
+  const [statusId, setStatusId] = useState(saved?.statusId ?? 2)
+  const [specialtyId, setSpecialtyId] = useState(saved?.specialtyId ?? '')
+  const [professionalId, setProfessionalId] = useState(saved?.professionalId ?? '')
+  const [patient, setPatient] = useState(saved?.patient ?? '')
+  const [procedure, setProcedure] = useState(saved?.procedure ?? '')
+  const [rows, setRows] = useState<ConfirmRow[] | null>(saved?.rows ?? null)
   const [loading, setLoading] = useState(false)
   const [calling, setCalling] = useState<string | null>(null)
   const [page, setPage] = useState(0)
@@ -32,13 +36,15 @@ export function ConfirmPanel({ brainId, canCall, onNotice, onStarted, onFailed, 
   const [testOpen, setTestOpen] = useState(false)
   const [test, setTest] = useState({ kind: 'confirm' as 'confirm' | 'missed', situation: 'faltou', phone: '', patientName: 'Maria da Silva Souza', professional: 'Dra. Ana Souza Exemplo', specialty: 'Psiquiatria', date: todayBr(), time: '08:00', valor: '102' })
   const [testing, setTesting] = useState(false)
-  const [updatedAt, setUpdatedAt] = useState<Date | null>(null)
-  const lastSearch = useRef<{ dateInit: string; dateFinish: string; statusId: number; specialtyId?: string; professionalId?: string } | null>(null)
+  const [updatedAt, setUpdatedAt] = useState<Date | null>(saved?.updatedAt ?? null)
+  const lastSearch = useRef<Saved['last']>(saved?.last ?? null)
+  const firstSpecialty = useRef(true)
+  useEffect(() => { saved = { dateInit, dateFinish, statusId, specialtyId, professionalId, patient, procedure, rows, updatedAt, last: lastSearch.current } })
   const fail = useCallback((cause: unknown, fallback: string) => onNotice(cause instanceof Error ? cause.message : fallback), [onNotice])
 
   useEffect(() => { void api.confirmOptions().then(setOptions).catch((c) => fail(c, 'Não foi possível carregar os filtros da AMEI.')) }, [fail])
   useEffect(() => {
-    setProfessionalId('')
+    if (firstSpecialty.current) firstSpecialty.current = false; else setProfessionalId('')
     if (!specialtyId) { setProfessionals([]); return }
     void api.confirmProfessionals(specialtyId).then(setProfessionals).catch(() => setProfessionals([]))
   }, [specialtyId])
@@ -125,6 +131,7 @@ export function ConfirmPanel({ brainId, canCall, onNotice, onStarted, onFailed, 
       <label>Procedimentos<select value={procedure} disabled={!procedures.length} onChange={(e) => { setProcedure(e.target.value); setPage(0) }}><option value="">Todos</option>{procedures.map((p) => <option key={p} value={p}>{p}</option>)}</select></label>
       {statusId === -1 && <p className="muted confirm-hint">Faltosos: junta <b>não compareceu</b>, <b>desmarcado pelo paciente</b> e <b>cancelado</b>, só de consultas que já passaram. Clique no telefone para a Giovana ligar, entender o que houve e oferecer nova consulta ou lista de espera.</p>}
       <button className="primary-button" disabled={loading || !dateInit || !dateFinish} onClick={() => void search()}><Search size={15}/> {loading ? 'Pesquisando...' : 'Pesquisar'}</button>
+      {rows !== null && <button className="ghost-button" disabled={loading} onClick={() => void search()}><RefreshCw size={15}/> Atualizar</button>}
     </section>
 
     {rows !== null && <div className="confirm-summary"><span className="tag">{rows.length} agendamento{rows.length === 1 ? '' : 's'}</span>{statusId === 2 && <span className="tag tag-ok">{confirmed} confirmados</span>}{updatedAt && <small className="muted">Atualizado às {updatedAt.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit', second: '2-digit' })} (renova sozinho a cada 20 s)</small>}</div>}

@@ -1,0 +1,33 @@
+import 'dotenv/config';
+import { chromium } from 'playwright';
+const password = process.env.OPERATOR_PASSWORD!;
+const shot = process.argv[2]!;
+const browser = await chromium.launch();
+const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+page.on('console', (m) => { if (m.type() === 'error') console.log('CONSOLE ERROR:', m.text().slice(0, 200)); });
+page.on('pageerror', (e) => console.log('PAGE ERROR:', e.message.slice(0, 300)));
+// Intercepta SÓ o início da ligação e o acompanhamento dela: nada é discado.
+let polls = 0;
+const fake = (status: string, extra: Record<string, unknown> = {}) => ({ id: 'fake-1', brainId: 'b', patientName: 'Rodrigo Augusto Andrade Ferreira Beppu', phone: '+5517997494821', status, startedAt: new Date().toISOString(), answeredAt: status === 'in_progress' ? new Date().toISOString() : null, createdAt: new Date().toISOString(), metadata: { contact_context: 'appointment_confirmation', appointment: { date: '2026-11-11', time: '08:00', specialty: 'Psiquiatria', professional: 'Dra. Camila Lucchese Veronesi' }, ...extra } });
+await page.route('**/api/amei/confirm/call', (route) => route.fulfill({ status: 201, contentType: 'application/json', body: JSON.stringify({ success: true, call: fake('connecting') }) }));
+await page.route('**/api/calls/fake-1', (route) => { polls++; const status = polls < 2 ? 'ringing' : polls < 4 ? 'in_progress' : 'in_progress'; const extra = polls >= 4 ? { confirmation: { outcome: 'confirmou' } } : {}; route.fulfill({ contentType: 'application/json', body: JSON.stringify({ call: fake(status, extra) }) }); });
+await page.goto('http://localhost:5173/');
+await page.waitForTimeout(2500); await page.screenshot({ path: shot.replace('.png', '-0.png') }); await page.locator('input[type=password]').fill(password);
+await page.getByRole('button', { name: /entrar/i }).click(); await page.waitForTimeout(2500); await page.screenshot({ path: shot.replace('.png', '-0b.png') });
+await page.getByRole('button', { name: /Confirmar agenda/ }).click();
+const dates = page.locator('input[type=date]');
+await dates.nth(0).fill('2026-11-11'); await dates.nth(1).fill('2026-11-11');
+await page.getByRole('button', { name: /Pesquisar/ }).click();
+await page.locator('table tbody tr').first().waitFor({ timeout: 30000 });
+const btn = page.locator('.icon-call').first();
+console.log('botão ligar habilitado:', await btn.isEnabled(), '| linhas:', await page.locator('table tbody tr').count());
+if (!(await btn.isEnabled())) { console.log('DISABLED -> motivo:', await page.locator('.confirm-panel, .page-panel > p.muted').allTextContents()); }
+page.once('dialog', (d) => { console.log('DIALOG:', d.message().slice(0, 140)); void d.accept(); });
+await btn.click({ force: true });
+await page.waitForTimeout(1500);
+console.log('widget visível (conectando):', await page.locator('.call-widget').count(), '|', (await page.locator('.call-widget').allTextContents()).join(' ').slice(0, 200));
+await page.screenshot({ path: shot.replace('.png', '-1.png') });
+await page.waitForTimeout(8000);
+console.log('widget depois:', (await page.locator('.call-widget').allTextContents()).join(' ').slice(0, 260));
+await page.screenshot({ path: shot });
+await browser.close();

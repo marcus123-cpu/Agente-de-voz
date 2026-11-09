@@ -21,3 +21,5 @@
 @media (max-width:560px){.call-widget{left:12px;right:12px;width:auto;bottom:12px}}
 
 .confirm-hint{grid-column:1/-1;margin:0}
+
+.cw-actions{display:flex;flex-wrap:wrap;gap:6px;padding:0 12px 8px}.cw-act{flex:1 1 auto;display:inline-flex;align-items:center;justify-content:center;gap:5px;background:#162033;border:1px solid #ffffff18;color:#cfdae7;border-radius:8px;font-size:11px;font-weight:700;padding:7px 8px;cursor:pointer}.cw-act:disabled{opacity:.5;cursor:default}.cw-act-on{background:#14532d;border-color:#22c55e66}.cw-act-take:not(:disabled){background:#7c3aed;color:#fff;border-color:#9c73ef}.cw-act-end:not(:disabled){background:#7f1d1d;border-color:#ef444466;color:#fff}.cw-err{flex-basis:100%;color:#fca5a5;font-size:10px}

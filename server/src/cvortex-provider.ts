@@ -309,8 +309,16 @@ class CvortexBrowserProvider {
       let sending = false;
       let nextTime = context.currentTime + 0.18;
       const scheduled = new Set<AudioBufferSourceNode>();
+      // Silencia o áudio local do webphone (o painel já toca a conversa) para não duplicar no fone.
+      // A ponte lê a trilha WebRTC direto, então o mute dos elementos não afeta a captura.
+      const touched = new Set<HTMLMediaElement>();
+      const muteLocal = () => { document.querySelectorAll('audio,video').forEach(el => { const media = el as HTMLMediaElement; if (!media.muted) { media.muted = true; touched.add(media); } }); };
+      muteLocal();
+      const muteTimer = setInterval(muteLocal, 500);
+      const unmuteLocal = () => { clearInterval(muteTimer); touched.forEach(media => { try { media.muted = false; } catch { /* removido */ } }); touched.clear(); };
       const restore = async () => {
-        if (w.__cvActiveBridge?.socket !== socket) return sender.track === microphone;
+        if (w.__cvActiveBridge?.socket !== socket) { unmuteLocal(); return sender.track === microphone; }
+        unmuteLocal(); if (gateTimer) clearTimeout(gateTimer);
         try { if (sender.track !== microphone) await sender.replaceTrack(microphone); microphone.enabled = microphoneWasEnabled; } catch { return false; }
         if (sender.track !== microphone) return false;
         w.__cvActiveBridge = null;
@@ -321,7 +329,32 @@ class CvortexBrowserProvider {
         return true;
       };
       w.__cvActiveBridge = { socket, restore };
+      // Só chama a IA (e gasta crédito) depois que o paciente atender. Durante o toque a trilha recebida traz o
+      // sinal de chamando (tom puro de ~425 Hz, taxa de cruzamentos por zero quase constante); a fala tem
+      // energia com cruzamentos bem diferentes. Se nada for detectado em 40 s, segue assim mesmo.
+      let gateOpen = false;
+      let speechFrames: number[] = [];
+      let gateTimer: ReturnType<typeof setTimeout> | null = null;
+      const openGate = () => {
+        if (gateOpen) return;
+        gateOpen = true;
+        if (gateTimer) clearTimeout(gateTimer);
+        if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'start' }));
+      };
+      const armAnswerGate = () => { gateTimer = setTimeout(openGate, 40000); };
+      const detectAnswer = (samples: Float32Array) => {
+        if (gateOpen) return;
+        let sum = 0, crossings = 0;
+        for (let i = 0; i < samples.length; i++) { const v = samples[i]!; sum += v * v; if (i && (v >= 0) !== (samples[i - 1]! >= 0)) crossings++; }
+        const rms = Math.sqrt(sum / samples.length);
+        const rate = crossings * context.sampleRate / samples.length;   // cruzamentos por segundo (tom de 425 Hz ≈ 850)
+        const now = performance.now();
+        if (rms > 0.004 && Math.abs(rate - 850) > 180) speechFrames.push(now);
+        speechFrames = speechFrames.filter(t => now - t < 1500);
+        if (speechFrames.length >= 3) openGate();
+      };
       processor.onaudioprocess = event => {
+        if (authenticated && !gateOpen) detectAnswer(event.inputBuffer.getChannelData(0));
         if (!authenticated || !sending || socket.readyState !== WebSocket.OPEN || socket.bufferedAmount > 512000) return;
         const samples = event.inputBuffer.getChannelData(0);
         const inputRate = context.sampleRate;
@@ -340,7 +373,7 @@ class CvortexBrowserProvider {
         if (typeof event.data === 'string') {
           let control: { type?: string };
           try { control = JSON.parse(event.data) as { type?: string }; } catch { return; }
-          if (control.type === 'hello-ok') { authenticated = true; socket.send(JSON.stringify({ type: 'start' })); }
+          if (control.type === 'hello-ok') { authenticated = true; armAnswerGate(); }
           if (control.type === 'agent-ready') {
             try {
               await sender.replaceTrack(output.stream.getAudioTracks()[0]!);
@@ -384,10 +417,6 @@ class CvortexBrowserProvider {
     const browserScript = `(() => { const __name = (fn) => fn; return (${browserBridge.toString()})(${JSON.stringify({ port: BRIDGE_PORT, nonce: session.nonce.toString('hex') })}); })()`;
     const report = await page.evaluate(browserScript) as { opened: boolean; sampleRate: number; senderKind?: string; receiverKind?: string };
     if (!report.opened || report.senderKind !== 'audio' || report.receiverKind !== 'audio') throw new Error('Mídia do webphone indisponível.');
-    session.mediaTimer = setTimeout(() => {
-      if (!session.mediaReady && !session.ending && !session.ended) void this.bridgeFailed(session, new Error('A ponte de áudio não ficou pronta dentro do prazo.'));
-    }, 20_000);
-    session.mediaTimer.unref?.();
   }
 
   private acceptBrowserSocket(session: Session, socket: WebSocket): void {
@@ -415,6 +444,14 @@ class CvortexBrowserProvider {
       }
       let message: { type?: string } = {};
       try { message = JSON.parse(payload.toString()) as typeof message; } catch { return; }
+      if (message.type === 'start' && !session.takenOver) {
+        console.info('[CVORTEX] paciente atendeu (voz detectada); conectando a Giovana', session.options.callId);
+        // O prazo de 20 s só conta depois que o paciente atende; durante o toque a IA nem é chamada.
+        session.mediaTimer = setTimeout(() => {
+          if (!session.mediaReady && !session.ending && !session.ended) void this.bridgeFailed(session, new Error('A ponte de áudio não ficou pronta dentro do prazo.'));
+        }, 20_000);
+        session.mediaTimer.unref?.();
+      }
       if (message.type === 'start' && !session.takenOver) void this.connectAgent(session).catch(error => this.bridgeFailed(session, error));
       if (message.type === 'media-ready') {
         session.mediaReady = true;

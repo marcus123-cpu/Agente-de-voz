@@ -1,0 +1,10 @@
+import { chromium } from 'playwright';
+const browser = await chromium.connectOverCDP('http://127.0.0.1:9223');
+const page = browser.contexts()[0].pages().find(p => p.url().startsWith('https://amei.amorsaude.com.br'));
+const out = process.argv[2];
+await page.screenshot({ path: out, fullPage: false });
+const labels = await page.evaluate(() => [...document.querySelectorAll('label, th, button, [role=combobox], input, select')].map(e => (e.tagName+':'+(e.textContent||e.placeholder||e.getAttribute('aria-label')||'').trim().slice(0,40))).filter(x=>x.length>6).slice(0,90));
+console.log(labels.join('\n'));
+const scripts = await page.evaluate(() => [...document.scripts].map(s=>s.src).filter(Boolean));
+console.log(scripts.join('\n'));
+process.exit(0);
