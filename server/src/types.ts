@@ -1,4 +1,4 @@
-export type CallStatus = 'idle' | 'connecting' | 'ringing' | 'in_progress' | 'completed' | 'failed' | 'busy' | 'no_answer' | 'canceled';
+export type CallStatus = 'idle' | 'connecting' | 'ringing' | 'in_progress' | 'completed' | 'failed' | 'busy' | 'no_answer' | 'canceled' | 'voicemail';
 export type CallResult = 'interested' | 'not_interested' | 'callback' | 'do_not_contact' | 'unknown';
 
 export interface Brain {
@@ -11,7 +11,9 @@ export interface Call {
   startedAt: string | null; answeredAt: string | null; endedAt: string | null;
   durationSeconds: number | null; result: CallResult | null; transferRequested: boolean;
   summary: Record<string, unknown> | null; metadata: Record<string, unknown> | null; createdAt: string;
+  transcript: TranscriptTurn[] | null; flagged: boolean; flagReason: string | null;
 }
+export interface TranscriptTurn { role: 'agent' | 'patient'; message: string; timeInCallSecs: number }
 
 export type ContactSource = 'manual' | 'planilha' | 'cartao_de_todos' | 'ligacao';
 export interface Contact {

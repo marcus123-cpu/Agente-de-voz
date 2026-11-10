@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { chromium, type Browser, type Page } from 'playwright';
 
 /**
@@ -257,6 +258,41 @@ function matchSpecialty(list: Specialty[], wanted: string): Specialty | null {
 
 interface FreeSlot { date: string; time: string; professional: string }
 
+/** Horários livres (já filtrados pro futuro, ordenados) da especialidade para o time dado, nos próximos `days` dias. */
+async function upcomingFreeSlots(specialtyId: number | string, team: Professional[], days: number, refresh?: boolean): Promise<FreeSlot[]> {
+  if (!team.length) return [];
+  const today = nowBr();
+  const initialDate = today.date;
+  const finalDate = nowBr(days).date;
+  if (refresh) for (const k of [...cache.keys()]) if (k.startsWith(`slots:${specialtyId}:`)) cache.delete(k);
+  const key = `slots:${specialtyId}:${team.map(p => p.id).join(',')}:${initialDate}:${days}`;
+  const free = await cached(key, 2 * MINUTE, async () => {
+    const out: FreeSlot[] = [];
+    let cursor = 0;
+    const worker = async () => {
+      while (cursor < team.length) {
+        const professional = team[cursor++]!;
+        const qs = new URLSearchParams({ idClinic: CLINIC_ID, idSpecialty: String(specialtyId), idProfessional: String(professional.id), initialDate: initialDate.replaceAll('-', ''), finalDate: finalDate.replaceAll('-', ''), initialHour: '00:00', endHour: '23:59', fetchPolicy: 'network-only', cancelledAppointments: 'false' });
+        const data = await adapter.get<Array<{ hours?: Array<{ status?: string; date?: string; formatedHour?: string; idProfessional?: number | string; specialtyId?: number | string }> }>>(`/api/v1/slots/list-slots-by-professional?${qs}`);
+        if (!Array.isArray(data)) throw new AmeiError('A AMEI devolveu os horários num formato inesperado.');
+        for (const entry of data) for (const hour of entry.hours ?? []) {
+          if (norm(hour.status) !== 'livre') continue;
+          if (String(hour.idProfessional) !== String(professional.id) || String(hour.specialtyId) !== String(specialtyId)) continue;
+          const date = toIso(hour.date), time = toHour(hour.formatedHour);
+          if (date && time) out.push({ date, time, professional: professional.nome });
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(5, team.length) }, worker));
+    return out;
+  });
+  // Hoje só vale quem ainda está a mais de 1 hora de distância.
+  const [nh, nm] = today.time.split(':').map(Number) as [number, number];
+  const limit = `${String(Math.floor((nh * 60 + nm + 60) / 60) % 24).padStart(2, '0')}:${String((nm) % 60).padStart(2, '0')}`;
+  return free.filter(slot => slot.date > today.date || (slot.date === today.date && slot.time >= limit))
+    .sort((a, b) => (a.date + a.time).localeCompare(b.date + b.time));
+}
+
 /** Horários livres, em ordem, da especialidade (e profissional, se pedido) nos próximos dias. */
 export async function ameiFreeSlots(opts: { especialidade: string; profissional?: string; dias?: number; refresh?: boolean }): Promise<string> {
   const list = await specialties();
@@ -271,39 +307,8 @@ export async function ameiFreeSlots(opts: { especialidade: string; profissional?
   }
   if (!team.length) return `Não há profissionais de ${specialty.nome} na agenda agora.`;
   team = team.slice(0, 10);
-
   const days = Math.min(30, Math.max(1, Math.round(Number(opts.dias) || 14)));
-  const today = nowBr();
-  const initialDate = today.date;
-  const finalDate = nowBr(days).date;
-  if (opts.refresh) for (const k of [...cache.keys()]) if (k.startsWith(`slots:${specialty.id}:`)) cache.delete(k);
-  const key = `slots:${specialty.id}:${team.map(p => p.id).join(',')}:${initialDate}:${days}`;
-  const free = await cached(key, 2 * MINUTE, async () => {
-    const out: FreeSlot[] = [];
-    let cursor = 0;
-    const worker = async () => {
-      while (cursor < team.length) {
-        const professional = team[cursor++]!;
-        const qs = new URLSearchParams({ idClinic: CLINIC_ID, idSpecialty: String(specialty.id), idProfessional: String(professional.id), initialDate: initialDate.replaceAll('-', ''), finalDate: finalDate.replaceAll('-', ''), initialHour: '00:00', endHour: '23:59', fetchPolicy: 'network-only', cancelledAppointments: 'false' });
-        const data = await adapter.get<Array<{ hours?: Array<{ status?: string; date?: string; formatedHour?: string; idProfessional?: number | string; specialtyId?: number | string }> }>>(`/api/v1/slots/list-slots-by-professional?${qs}`);
-        if (!Array.isArray(data)) throw new AmeiError('A AMEI devolveu os horários num formato inesperado.');
-        for (const entry of data) for (const hour of entry.hours ?? []) {
-          if (norm(hour.status) !== 'livre') continue;
-          if (String(hour.idProfessional) !== String(professional.id) || String(hour.specialtyId) !== String(specialty.id)) continue;
-          const date = toIso(hour.date), time = toHour(hour.formatedHour);
-          if (date && time) out.push({ date, time, professional: professional.nome });
-        }
-      }
-    };
-    await Promise.all(Array.from({ length: Math.min(5, team.length) }, worker));
-    return out;
-  });
-
-  // Hoje só vale quem ainda está a mais de 1 hora de distância.
-  const [nh, nm] = today.time.split(':').map(Number) as [number, number];
-  const limit = `${String(Math.floor((nh * 60 + nm + 60) / 60) % 24).padStart(2, '0')}:${String((nm) % 60).padStart(2, '0')}`;
-  const upcoming = free.filter(slot => slot.date > today.date || (slot.date === today.date && slot.time >= limit))
-    .sort((a, b) => (a.date + a.time).localeCompare(b.date + b.time));
+  const upcoming = await upcomingFreeSlots(specialty.id, team, days, opts.refresh);
   if (!upcoming.length) return `Sem horários livres de ${specialty.nome} nos próximos ${days} dias. Diga que a equipe retorna assim que abrir vaga, e registre o interesse.`;
 
   const first = upcoming.slice(0, 8);
@@ -311,6 +316,23 @@ export async function ameiFreeSlots(opts: { especialidade: string; profissional?
   for (const slot of first) { const k = `${slot.date}|${slot.professional}`; byDay.set(k, [...(byDay.get(k) ?? []), slot]); }
   const lines = [...byDay.entries()].map(([k, slots]) => `- ${spoken(k.split('|')[0]!)} com ${slots[0]!.professional}: ${slots.map(s => s.time).join(', ')}`);
   return `Horários livres de ${specialty.nome} (próximos disponíveis, não agende; ofereça no máximo 2 ou 3 e registre a escolha para a equipe confirmar):\n${lines.join('\n')}`;
+}
+
+/**
+ * Versão estruturada (pro painel): quantas vagas e as próximas, pela especialidade/profissional já identificados
+ * por ID. Primeiro tenta só o profissional da consulta perdida; se não achar nada, amplia pra toda a especialidade
+ * (igual ao passo 4 do roteiro da Giovana: "se não houver horário desse profissional, chame de novo só com a especialidade").
+ */
+export interface AvailabilitySummary { count: number; next: Array<{ date: string; time: string; professional: string }>; professionalOnly: boolean }
+export async function ameiAvailabilityFor(specialtyId: string, professionalId?: string, days = 14): Promise<AvailabilitySummary> {
+  const team = await professionals(specialtyId);
+  if (professionalId) {
+    const own = team.filter(p => String(p.id) === professionalId);
+    const upcomingOwn = await upcomingFreeSlots(specialtyId, own, days);
+    if (upcomingOwn.length) return { count: upcomingOwn.length, next: upcomingOwn.slice(0, 3).map(({ date, time, professional }) => ({ date, time, professional })), professionalOnly: true };
+  }
+  const upcoming = await upcomingFreeSlots(specialtyId, team, days);
+  return { count: upcoming.length, next: upcoming.slice(0, 3).map(({ date, time, professional }) => ({ date, time, professional })), professionalOnly: false };
 }
 
 // ─── Consultas do paciente (confirmação) ─────────────────────────────────────────────────────────
@@ -424,9 +446,25 @@ export async function ameiConfirmList(filters: ConfirmFilters): Promise<{ rows: 
 }
 
 // ─── Contexto de uma consulta (para a ligação de confirmação) ───────────────────────────────────
-export interface AppointmentContext { appointmentId: string; date: string; time: string; patientName: string; phone: string; professional: string; specialty: string; statusId: number; /** valor da consulta na AMEI, ex.: "102" */ valor?: string; /** ligação de teste: nada é gravado na AMEI */ test?: boolean; /** confirm = consulta a confirmar; missed = consulta perdida (faltoso) */ kind?: 'confirm' | 'missed'; patientId?: string; specialtyId?: string; professionalId?: string }
+export interface AppointmentContext { appointmentId: string; date: string; time: string; patientName: string; phone: string; professional: string; specialty: string; statusId: number; /** valor da consulta na AMEI, ex.: "102" */ valor?: string; /** ligação de teste: nada é gravado na AMEI */ test?: boolean; /** confirm = consulta a confirmar; missed = consulta perdida (faltoso); waitlist = paciente na lista de espera sem consulta futura */ kind?: 'confirm' | 'missed' | 'waitlist'; patientId?: string; specialtyId?: string; professionalId?: string; /** faltoso: já reagendou/foi atendido depois? (conferido na AMEI antes de ligar) */ recovery?: RecoveryInfo; /** lista de espera: id da entrada (não é um appointmentId de verdade) */ waitlistId?: string }
 const STATUS_AGENDADO = 2, STATUS_CONFIRMADO = 16, STATUS_DESMARCADO_PACIENTE = 9;
-const titleCase = (value: string): string => value.toLocaleLowerCase('pt-BR').replace(/(^|\s)(\p{L})/gu, (_m, space: string, letter: string) => space + letter.toLocaleUpperCase('pt-BR')).replace(/\s(Da|De|Do|Das|Dos|E)(?=\s)/g, m => m.toLowerCase());
+const titleCase = (value: string): string => {
+  let out = value.toLocaleLowerCase('pt-BR').replace(/(^|\s)(\p{L})/gu, (_m, space: string, letter: string) => space + letter.toLocaleUpperCase('pt-BR')).replace(/\s(Da|De|Do|Das|Dos|E)(?=\s)/g, m => m.toLowerCase())
+    // nome e sobrenome cadastrados na AMEI as vezes repetem a mesma palavra (ex.: "Dulcineia Fanti Fanti"),
+    // o que faz a TTS ler com uma prosodia estranha; remove repeticoes consecutivas antes de falar.
+    .replace(/\b(\p{L}+)(\s+\1)+\b/giu, '$1');
+  // Também acontece de nome E sobrenome virem cadastrados duplicados inteiros (ex.: "Marissol Aparecida
+  // Vicente Xavier dos Santos Marissol Aparecida Vicente Xavier dos Santos"): se a frase toda se divide em
+  // duas metades iguais, fica só com a primeira.
+  const words = out.trim().split(/\s+/);
+  if (words.length >= 2 && words.length % 2 === 0) {
+    const half = words.length / 2;
+    const first = words.slice(0, half).join(' ');
+    const second = words.slice(half).join(' ');
+    if (first.toLocaleLowerCase('pt-BR') === second.toLocaleLowerCase('pt-BR')) out = first;
+  }
+  return out;
+};
 
 interface AppointmentDetail {
   id: number | string; clinica: number | string; data: string; horaInicio: string; statusAgendamento: number; valorTotal?: number | string;
@@ -572,11 +610,118 @@ export async function ameiMissedContext(appointmentId: string): Promise<Appointm
   let title = '';
   try { title = (await professionalTitles(detail.especialidadeId.id)).get(String(detail.profissionalId?.id)) ?? ''; } catch { /* sem tratamento */ }
   const professional = [title, titleCase([detail.profissionalId?.nome, detail.profissionalId?.sobrenome].filter(Boolean).join(' '))].filter(Boolean).join(' ').trim();
+  const specialty = String(detail.especialidadeId.descricao ?? '').trim();
+  const patientId = String(detail.pacienteId.id);
+  const recovery = await ameiRecoveryStatus({ appointmentId, date, time, specialty, patientId });
   return {
-    appointmentId, date, time, patientName: titleCase(patientName), phone, professional, specialty: String(detail.especialidadeId.descricao ?? '').trim(), statusId,
+    appointmentId, date, time, patientName: titleCase(patientName), phone, professional, specialty, statusId,
     valor: detail.valorTotal != null && Number(detail.valorTotal) > 0 ? String(detail.valorTotal) : undefined,
-    kind: 'missed', patientId: String(detail.pacienteId.id), specialtyId: String(detail.especialidadeId.id), professionalId: detail.profissionalId?.id != null ? String(detail.profissionalId.id) : undefined,
+    kind: 'missed', patientId, specialtyId: String(detail.especialidadeId.id), professionalId: detail.profissionalId?.id != null ? String(detail.profissionalId.id) : undefined, recovery,
   };
+}
+
+// ─── Recuperação: o paciente faltoso já reagendou (ou já foi atendido de novo)? ──────────────────
+// Mesma ideia do bot-amei (RECUPERACAO-ENTREGA.md): olha o histórico de consultas do paciente depois
+// da consulta perdida e classifica. Erro ou dado incompleto NUNCA vira "pendente" (nunca afirma
+// falsamente que ele não reagendou); nesses casos cai em "conferir".
+export type RecoveryStatus = 'reagendado' | 'recuperado' | 'outra_especialidade' | 'nova_falta' | 'reagendamento_cancelado' | 'pendente' | 'conferir';
+export interface RecoveryInfo { status: RecoveryStatus; label: string; next?: { date: string; time: string; specialty: string }; availability?: AvailabilitySummary }
+const RECOVERY_LABELS: Record<RecoveryStatus, string> = {
+  reagendado: 'Já reagendou', recuperado: 'Já foi atendido depois', outra_especialidade: 'Agendou outra especialidade',
+  nova_falta: 'Tentou remarcar e faltou de novo', reagendamento_cancelado: 'Remarcou e cancelou de novo',
+  pendente: 'Ainda não reagendou', conferir: 'Conferir na AMEI',
+};
+// Mesmos IDs usados pelo bot-amei (mesma clínica/AMEI): compareceu, cancelado/desmarcado, não compareceu.
+const ATTENDED_IDS = new Set([5, 7, 11, 14, 60, 83]);
+const CANCELLED_IDS = new Set([3, 8, 9]);
+interface HistoryRow { appointmentId: string; date: string; time: string; specialty: string; statusId: number }
+/** Todos os IDs de status oficiais da AMEI (usado pra "sem filtro de status" nas buscas que exigem o parâmetro). */
+async function allStatusIds(): Promise<number[]> {
+  const statuses = await cached('statuses', 30 * MINUTE, () => adapter.get<Array<{ value: number; title: string }>>('/api/v1/status_appointments'));
+  const ids = (Array.isArray(statuses) ? statuses : []).map(item => Number(item.value)).filter(Number.isInteger);
+  if (!ids.length) throw new AmeiError('A AMEI não devolveu os status oficiais.');
+  return ids;
+}
+/** Todo o histórico de consultas do paciente, da data da consulta perdida até o fim dos tempos, com defesas contra paginação inconsistente. */
+async function recoveryHistory(patientId: string, fromDateIso: string): Promise<HistoryRow[]> {
+  const statusIds = await allStatusIds();
+  const qsOf = (page: number) => {
+    const qs = new URLSearchParams({ patientId, dateInit: fromDateIso.replaceAll('-', ''), dateEnd: '99991231', limit: '100', page: String(page) });
+    for (const id of statusIds) qs.append('statusAppointmentId', String(id));
+    return qs;
+  };
+  const first = await adapter.get<{ items?: Array<Record<string, unknown>>; meta?: { totalItems?: number } }>(`/api/v1/appointments/confirm/status/all?${qsOf(1)}`);
+  if (!Array.isArray(first.items) || !Number.isInteger(first.meta?.totalItems)) throw new AmeiError('Histórico num formato inesperado.');
+  const total = first.meta!.totalItems!;
+  const items: Array<Record<string, unknown>> = [...first.items];
+  const pageSize = first.items.length || 100;
+  const pages = Math.max(1, Math.ceil(total / pageSize));
+  if (pages > 1000) throw new AmeiError('Histórico grande demais.');
+  for (let page = 2; page <= pages; page++) {
+    const data = await adapter.get<{ items?: Array<Record<string, unknown>>; meta?: { totalItems?: number } }>(`/api/v1/appointments/confirm/status/all?${qsOf(page)}`);
+    if (!Array.isArray(data.items)) throw new AmeiError('Histórico num formato inesperado.');
+    if (data.meta?.totalItems !== total) throw new AmeiError('O histórico mudou durante a consulta.');
+    items.push(...data.items);
+  }
+  if (items.length !== total) throw new AmeiError('Página do histórico faltando.');
+  // Atenção: /confirm/status/all devolve nomes de campo diferentes de /confirm/status (sem o /all):
+  // id (não agendamentoId), data + horaInicio separados (não dataHoraInicio junto), especialidadeId.descricao
+  // (objeto, não string), statusAgendamento (não statusId). Confirmado lendo o parser real do bot-amei.
+  const seen = new Set<string>();
+  const rows: HistoryRow[] = [];
+  for (const item of items) {
+    const raw = item as { id?: unknown; data?: unknown; horaInicio?: unknown; especialidadeId?: { descricao?: unknown }; statusAgendamento?: unknown; pacienteId?: { id?: unknown } | unknown };
+    const appointmentId = String(raw.id ?? '');
+    if (!appointmentId || seen.has(appointmentId)) throw new AmeiError('Histórico com consulta repetida.');
+    seen.add(appointmentId);
+    const patientOnItem = raw.pacienteId && typeof raw.pacienteId === 'object' ? (raw.pacienteId as { id?: unknown }).id : raw.pacienteId;
+    if (patientOnItem != null && String(patientOnItem) !== patientId) throw new AmeiError('Histórico trouxe consulta de outro paciente.');
+    const date = toIso(raw.data), time = toHour(raw.horaInicio);
+    const statusId = Number(raw.statusAgendamento);
+    if (!date || !time || !Number.isInteger(statusId)) throw new AmeiError('Histórico com consulta sem data, hora ou status.');
+    rows.push({ appointmentId, date, time, specialty: String(raw.especialidadeId?.descricao ?? '').trim(), statusId });
+  }
+  return rows;
+}
+const sortByWhen = (rows: HistoryRow[]) => [...rows].sort((a, b) => (a.date + a.time).localeCompare(b.date + b.time));
+const pick = (row: HistoryRow): RecoveryInfo['next'] => ({ date: row.date, time: row.time, specialty: row.specialty });
+/** Situação de recuperação de uma consulta perdida (faltou/desmarcou/cancelou) a partir do que já se sabe dela. */
+export async function ameiRecoveryStatus(original: { appointmentId: string; date: string; time: string; specialty: string; patientId: string }): Promise<RecoveryInfo> {
+  try {
+    const history = await recoveryHistory(original.patientId, original.date);
+    if (!history.some(row => row.appointmentId === original.appointmentId)) throw new AmeiError('Consulta original ausente do histórico.');
+    const later = history.filter(row => row.appointmentId !== original.appointmentId && `${row.date} ${row.time}` > `${original.date} ${original.time}`);
+    const now = nowBr();
+    if (later.some(row => ATTENDED_IDS.has(row.statusId) && `${row.date} ${row.time}` > `${now.date} ${now.time}`)) throw new AmeiError('Consulta futura marcada como atendida; dado suspeito.');
+    const same = later.filter(row => norm(row.specialty) === norm(original.specialty));
+    const activeSame = sortByWhen(same.filter(row => row.statusId === 2 || row.statusId === 16 || row.statusId === 18 || ATTENDED_IDS.has(row.statusId)));
+    const attended = activeSame.filter(row => ATTENDED_IDS.has(row.statusId));
+    if (attended.length) return { status: 'recuperado', label: RECOVERY_LABELS.recuperado, next: pick(attended[attended.length - 1]!) };
+    if (activeSame.length) return { status: 'reagendado', label: RECOVERY_LABELS.reagendado, next: pick(activeSame[0]!) };
+    const otherSpecialty = sortByWhen(later.filter(row => norm(row.specialty) !== norm(original.specialty) && (row.statusId === 2 || row.statusId === 16 || row.statusId === 18 || ATTENDED_IDS.has(row.statusId))));
+    if (otherSpecialty.length) return { status: 'outra_especialidade', label: RECOVERY_LABELS.outra_especialidade, next: pick(otherSpecialty[0]!) };
+    const failedAgain = sortByWhen(same.filter(row => CANCELLED_IDS.has(row.statusId) || row.statusId === 17));
+    if (failedAgain.length) { const last = failedAgain[failedAgain.length - 1]!; return { status: last.statusId === 17 ? 'nova_falta' : 'reagendamento_cancelado', label: RECOVERY_LABELS[last.statusId === 17 ? 'nova_falta' : 'reagendamento_cancelado'], next: pick(last) }; }
+    if (same.length) throw new AmeiError('Consulta futura com status desconhecido.');
+    return { status: 'pendente', label: RECOVERY_LABELS.pendente };
+  } catch (error) {
+    console.error('[AMEI] recuperação de faltoso indisponível:', error instanceof Error ? error.message : error);
+    return { status: 'conferir', label: RECOVERY_LABELS.conferir };
+  }
+}
+const NEEDS_RECOVERY: ReadonlySet<RecoveryStatus> = new Set(['pendente', 'nova_falta', 'reagendamento_cancelado']);
+export async function ameiRecoveryStatusOf(appointmentId: string): Promise<RecoveryInfo> {
+  return cached(`recovery:${appointmentId}`, 5 * MINUTE, async () => {
+    const detail = await appointmentDetail(appointmentId);
+    const date = toIso(detail.data), time = toHour(detail.horaInicio);
+    if (!date || !time || !detail.pacienteId?.id || !detail.especialidadeId?.id) return { status: 'conferir' as const, label: RECOVERY_LABELS.conferir };
+    const info = await ameiRecoveryStatus({ appointmentId, date, time, specialty: String(detail.especialidadeId.descricao ?? ''), patientId: String(detail.pacienteId.id) });
+    if (!NEEDS_RECOVERY.has(info.status)) return info;
+    try {
+      const availability = await ameiAvailabilityFor(String(detail.especialidadeId.id), detail.profissionalId?.id != null ? String(detail.profissionalId.id) : undefined);
+      return { ...info, availability };
+    } catch { return info; }
+  });
 }
 
 // ─── Lista de espera (única outra escrita na AMEI além de confirmar/desmarcar) ──────────────────
@@ -618,4 +763,221 @@ export async function addToWaitlist(input: { cpf: string; patientId: string; spe
   await adapter.post('/api/v1/lista-espera', { cpf, pacienteId: Number(input.patientId), especialidadeId: Number(input.specialtyId), profissionalId: input.professionalId ? Number(input.professionalId) : '', observacoes: note });
   if (!(await waitlistOf(input.patientId)).some(item => isPendingFor(item, input.patientId, input.specialtyId))) throw new AmeiError('A AMEI não confirmou a inclusão na lista de espera; confira manualmente.');
   return 'Paciente colocado na lista de espera.';
+}
+
+interface WaitlistDetail { id: number; status?: string; unidadeId?: number | string; pacienteId?: number | string; especialidadeId?: number | string; profissionalId?: number | string | ''; pacienteNome?: string; pacienteSobrenome?: string; pacienteCelular?: string }
+/** Lê a entrada da lista de espera direto da AMEI e monta o contexto da ligação de captação (sem consulta futura marcada). */
+export async function ameiWaitlistContext(waitlistId: string): Promise<AppointmentContext> {
+  if (!/^\d{1,12}$/.test(waitlistId)) throw new AmeiError('Entrada da lista de espera inválida.');
+  const detail = await adapter.get<WaitlistDetail>(`/api/v1/lista-espera/${waitlistId}`);
+  if (!detail || String(detail.id) !== waitlistId) throw new AmeiError('A AMEI não devolveu essa entrada da lista de espera.');
+  if (String(detail.unidadeId) !== CLINIC_ID) throw new AmeiError('Essa entrada não é da unidade de Fernandópolis.');
+  if (norm(detail.status) !== 'pendente') throw new AmeiError('Essa entrada não está mais pendente na lista de espera; atualize a lista.');
+  const patientName = [detail.pacienteNome, detail.pacienteSobrenome].filter(Boolean).join(' ').trim();
+  const phone = digits(detail.pacienteCelular);
+  if (!patientName || phone.length < 10) throw new AmeiError('A entrada está sem nome ou celular do paciente.');
+  if (!detail.pacienteId || !detail.especialidadeId) throw new AmeiError('A entrada está sem paciente ou especialidade na AMEI.');
+  const patientId = String(detail.pacienteId), specialtyId = String(detail.especialidadeId);
+  const list = await specialties();
+  const specialty = list.find(item => String(item.id) === specialtyId);
+  if (!specialty) throw new AmeiError('Especialidade da lista de espera não encontrada na AMEI.');
+  const professionalId = detail.profissionalId ? String(detail.profissionalId) : undefined;
+  let professional = '';
+  if (professionalId) {
+    const team = await professionals(specialtyId);
+    const match = team.find(p => String(p.id) === professionalId);
+    professional = match?.nome ?? '';
+  }
+  // Confere de novo, na hora de ligar, que ele ainda não tem consulta futura dessa especialidade (pode ter mudado desde a busca).
+  const today = nowBr();
+  const history = await recoveryHistory(patientId, today.date);
+  const hasFuture = history.some(row => norm(row.specialty) === norm(specialty.nome) && `${row.date} ${row.time}` >= `${today.date} ${today.time}` && (row.statusId === 2 || row.statusId === 16 || row.statusId === 18 || ATTENDED_IDS.has(row.statusId)));
+  if (hasFuture) throw new AmeiError('O paciente já tem uma consulta futura dessa especialidade; não é mais caso de lista de espera.');
+  return {
+    appointmentId: `waitlist:${waitlistId}`, waitlistId, date: today.date, time: today.time, patientName: titleCase(patientName), phone, professional, specialty: specialty.nome, statusId: 0,
+    kind: 'waitlist', patientId, specialtyId, professionalId,
+  };
+}
+
+// ─── Captação: preencher agenda buscando faltosos sem reagendamento ou lista de espera esquecida ─
+// Busca ESTRITA: qualquer dúvida (erro, histórico incompleto, status desconhecido) exclui a linha
+// em vez de incluir. Zero falso positivo importa mais que achar todo mundo.
+export type CampaignMode = 'faltosos' | 'lista_espera';
+export interface CampaignRow {
+  id: string; mode: CampaignMode; patientId: string; patientName: string; phone: string;
+  specialty: string; specialtyId: string; professional?: string; professionalId?: string;
+  originDate: string; situation?: MissedSituation; recoveryStatus: RecoveryStatus; availability?: AvailabilitySummary;
+}
+export interface CampaignFilters { mode: CampaignMode; specialtyId: string; professionalId?: string; monthFrom: string; monthTo: string }
+export interface CampaignJobStatus { jobId: string; status: 'running' | 'done' | 'error'; checked: number; total: number; found: number; results: CampaignRow[]; truncated: boolean; error?: string }
+
+const MONTH = /^\d{4}-\d{2}$/;
+const campaignJobs = new Map<string, CampaignJobStatus>();
+const CAMPAIGN_MAX = 300;
+const CAMPAIGN_JOB_TTL_MS = 15 * 60_000;
+
+function monthsBetween(from: string, to: string): number {
+  const [fy, fm] = from.split('-').map(Number) as [number, number];
+  const [ty, tm] = to.split('-').map(Number) as [number, number];
+  return (ty - fy) * 12 + (tm - fm);
+}
+/** Primeiro e último dia (AAAA-MM-DD) do intervalo de meses, inclusive. */
+function monthRangeDays(monthFrom: string, monthTo: string): { first: string; last: string } {
+  const [fy, fm] = monthFrom.split('-').map(Number) as [number, number];
+  const [ty, tm] = monthTo.split('-').map(Number) as [number, number];
+  const first = `${monthFrom}-01`;
+  const lastDay = new Date(Date.UTC(ty, tm, 0)).getUTCDate(); // dia 0 do mês seguinte = último dia do mês tm
+  const last = `${monthTo}-${String(lastDay).padStart(2, '0')}`;
+  void fy; void fm;
+  return { first, last };
+}
+
+export function startCampaignSearch(filters: CampaignFilters): string {
+  if (filters.mode !== 'faltosos' && filters.mode !== 'lista_espera') throw new AmeiError('Escolha o tipo de busca: faltosos ou lista de espera.');
+  if (!/^\d{1,10}$/.test(filters.specialtyId)) throw new AmeiError('Escolha uma especialidade válida.');
+  if (filters.professionalId && !/^\d{1,10}$/.test(filters.professionalId)) throw new AmeiError('Profissional inválido.');
+  if (!MONTH.test(filters.monthFrom) || !MONTH.test(filters.monthTo)) throw new AmeiError('Informe o período em meses (ano-mês).');
+  if (filters.monthFrom > filters.monthTo) throw new AmeiError('O mês final não pode ser antes do mês inicial.');
+  if (monthsBetween(filters.monthFrom, filters.monthTo) > 24) throw new AmeiError('Escolha no máximo 24 meses por busca.');
+  const jobId = randomUUID();
+  const job: CampaignJobStatus = { jobId, status: 'running', checked: 0, total: 0, found: 0, results: [], truncated: false };
+  campaignJobs.set(jobId, job);
+  void runCampaignSearch(job, filters).catch(error => {
+    job.status = 'error';
+    job.error = error instanceof AmeiError ? error.message : 'Não foi possível concluir a busca.';
+  }).finally(() => {
+    const timer = setTimeout(() => campaignJobs.delete(jobId), CAMPAIGN_JOB_TTL_MS);
+    timer.unref?.();
+  });
+  return jobId;
+}
+export function getCampaignSearch(jobId: string): CampaignJobStatus {
+  const job = campaignJobs.get(jobId);
+  if (!job) throw new AmeiError('Busca não encontrada ou expirada.');
+  return job;
+}
+
+async function runCampaignSearch(job: CampaignJobStatus, filters: CampaignFilters): Promise<void> {
+  if (filters.mode === 'faltosos') await runFaltososCampaign(job, filters);
+  else await runWaitlistCampaign(job, filters);
+  job.status = 'done';
+}
+
+/** Candidatos a faltoso (id + quando) no período, sem o limite de 31 dias que a tela de Confirmar agenda tem. */
+async function faltosoCandidates(filters: CampaignFilters): Promise<Array<{ appointmentId: string; date: string; time: string }>> {
+  const { first, last } = monthRangeDays(filters.monthFrom, filters.monthTo);
+  const rows: Array<{ appointmentId: string; date: string; time: string }> = [];
+  let total = 0;
+  for (let page = 1; page <= 200; page++) {
+    const qs = new URLSearchParams({ dateInit: first.replaceAll('-', ''), dateFinish: last.replaceAll('-', ''), unitId: CLINIC_ID, specialtyId: filters.specialtyId, page: String(page), limit: '100' });
+    if (filters.professionalId) qs.set('professionalId', filters.professionalId);
+    for (const id of MISSED_STATUSES) qs.append('statusAppointmentId', String(id));
+    const data = await adapter.get<{ items?: Array<Record<string, unknown>>; meta?: { totalItems?: number } }>(`/api/v1/appointments/confirm/status?${qs}`);
+    if (!Array.isArray(data.items) || !Number.isInteger(data.meta?.totalItems)) throw new AmeiError('A AMEI devolveu a lista de faltosos num formato inesperado.');
+    total = data.meta!.totalItems!;
+    for (const item of data.items) {
+      const [day, hour] = String(item.dataHoraInicio ?? '').split(/[ T]/);
+      const date = toIso(day), time = toHour(hour);
+      if (date && time && item.agendamentoId) rows.push({ appointmentId: String(item.agendamentoId), date, time });
+    }
+    if (rows.length >= total || !data.items.length) break;
+  }
+  const now = nowBr();
+  return rows.filter(r => `${r.date} ${r.time}` <= `${now.date} ${now.time}`);
+}
+
+async function runFaltososCampaign(job: CampaignJobStatus, filters: CampaignFilters): Promise<void> {
+  let candidates = await faltosoCandidates(filters);
+  candidates.sort((a, b) => (b.date + b.time).localeCompare(a.date + a.time)); // mais recentes primeiro
+  if (candidates.length > CAMPAIGN_MAX) { candidates = candidates.slice(0, CAMPAIGN_MAX); job.truncated = true; }
+  job.total = candidates.length;
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < candidates.length) {
+      const candidate = candidates[cursor++]!;
+      try {
+        const context = await ameiMissedContext(candidate.appointmentId);
+        if (context.recovery && NEEDS_RECOVERY.has(context.recovery.status) && context.patientId && context.specialtyId) {
+          const availability = await ameiAvailabilityFor(context.specialtyId, context.professionalId).catch(() => undefined);
+          job.results.push({
+            id: context.appointmentId, mode: 'faltosos', patientId: context.patientId, patientName: context.patientName, phone: context.phone,
+            specialty: context.specialty, specialtyId: context.specialtyId, professional: context.professional || undefined, professionalId: context.professionalId,
+            originDate: context.date, situation: missedSituationOf(context.statusId), recoveryStatus: context.recovery.status, availability,
+          });
+          job.found = job.results.length;
+        }
+      } catch (error) { console.error('[AMEI] captação (faltosos): candidato pulado', candidate.appointmentId, error instanceof Error ? error.message : error); }
+      job.checked++;
+    }
+  };
+  await Promise.all([worker(), worker(), worker()]);
+}
+
+interface CampaignWaitlistItem {
+  id: number; criadoEm?: string;
+  pacienteId?: { id?: number | string; nome?: string; sobrenome?: string; celular?: string };
+  statusId?: { description?: string };
+  especialidadeId?: { id?: number | string; descricao?: string };
+  profissionalId?: { id?: number | string; tratamento?: string; nome?: string; sobrenome?: string } | null;
+  agendamento?: unknown;
+}
+async function waitlistBySpecialty(specialtyId: string): Promise<CampaignWaitlistItem[]> {
+  const found: CampaignWaitlistItem[] = [];
+  let total = Infinity;
+  for (let page = 1; page <= 100 && found.length < total; page++) {
+    const data = await adapter.get<{ items?: CampaignWaitlistItem[]; meta?: { totalItems?: number } }>(`/api/v1/lista-espera?especialidadeId=${specialtyId}&page=${page}&limit=100`);
+    if (!Array.isArray(data?.items)) throw new AmeiError('A AMEI devolveu a lista de espera num formato inesperado.');
+    if (!data.items.length) break;
+    total = Number.isInteger(data.meta?.totalItems) ? data.meta!.totalItems! : data.items.length;
+    found.push(...data.items);
+    if (page * 100 >= total) break;
+  }
+  return found;
+}
+/** Tem consulta futura ATIVA (agendada/confirmada/remarcada) ou já ATENDIDA dessa especialidade? Erro = assume que sim (estrito). */
+async function hasFutureAppointment(patientId: string, specialtyName: string): Promise<boolean> {
+  const today = nowBr().date;
+  const history = await recoveryHistory(patientId, today);
+  const wanted = norm(specialtyName);
+  return history.some(row => norm(row.specialty) === wanted && (ATTENDED_IDS.has(row.statusId) || row.statusId === STATUS_AGENDADO || row.statusId === STATUS_CONFIRMADO || row.statusId === 18));
+}
+
+async function runWaitlistCampaign(job: CampaignJobStatus, filters: CampaignFilters): Promise<void> {
+  const items = await waitlistBySpecialty(filters.specialtyId);
+  let candidates = items.filter(item => {
+    if (norm(item.statusId?.description) !== 'pendente') return false;
+    const month = String(item.criadoEm ?? '').slice(0, 7);
+    if (!MONTH.test(month) || month < filters.monthFrom || month > filters.monthTo) return false;
+    if (filters.professionalId) { const pid = item.profissionalId?.id; if (pid != null && String(pid) !== filters.professionalId) return false; }
+    if (item.agendamento != null) return false;
+    if (!item.pacienteId?.id) return false;
+    return true;
+  });
+  candidates.sort((a, b) => String(a.criadoEm ?? '').localeCompare(String(b.criadoEm ?? ''))); // mais antigos primeiro
+  if (candidates.length > CAMPAIGN_MAX) { candidates = candidates.slice(0, CAMPAIGN_MAX); job.truncated = true; }
+  job.total = candidates.length;
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < candidates.length) {
+      const item = candidates[cursor++]!;
+      try {
+        const patientId = String(item.pacienteId!.id);
+        const specialty = String(item.especialidadeId?.descricao ?? '');
+        const already = await hasFutureAppointment(patientId, specialty).catch(() => true); // dúvida = assume que tem, exclui
+        if (!already) {
+          const specialtyId = String(item.especialidadeId?.id ?? filters.specialtyId);
+          const professionalId = item.profissionalId?.id != null ? String(item.profissionalId.id) : undefined;
+          const professional = item.profissionalId ? [item.profissionalId.tratamento, titleCase([item.profissionalId.nome, item.profissionalId.sobrenome].filter(Boolean).join(' '))].filter(Boolean).join(' ').trim() : undefined;
+          const availability = await ameiAvailabilityFor(specialtyId, professionalId).catch(() => undefined);
+          job.results.push({
+            id: String(item.id), mode: 'lista_espera', patientId, patientName: titleCase([item.pacienteId!.nome, item.pacienteId!.sobrenome].filter(Boolean).join(' ')), phone: digits(item.pacienteId!.celular),
+            specialty, specialtyId, professional, professionalId, originDate: String(item.criadoEm).slice(0, 10), recoveryStatus: 'pendente', availability,
+          });
+          job.found = job.results.length;
+        }
+      } catch (error) { console.error('[AMEI] captação (lista de espera): candidato pulado', item.id, error instanceof Error ? error.message : error); }
+      job.checked++;
+    }
+  };
+  await Promise.all([worker(), worker(), worker()]);
 }

@@ -84,6 +84,7 @@ test('serviço cVortex: estados monotônicos, persistência adiada e discagem am
       start: async options => { startCount++; lastContactContext = options.contactContext; if (ambiguous) throw new CvortexAmbiguousStartError(); confirmEnded = () => { void options.onEnded?.('completed'); }; connectAgent = () => { void options.onAgentConnected?.(); }; },
       end: async () => { endCount++; },
       takeover: async () => { takeoverCount++; },
+      markAnswered: async () => undefined,
     });
 
     await test('eventos atrasados não regridem estado e terminal não reabre', async () => {

@@ -1,10 +1,48 @@
-import { useEffect } from 'react'
+import { useEffect, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react'
 import { CheckCircle2, Hand, PhoneCall, PhoneOff, RotateCcw, X, XCircle } from 'lucide-react'
 import type { Call, CallStatus } from './types'
 import { LiveListen } from './LiveListen'
 
-const statusText: Record<CallStatus, string> = { idle: 'Aguardando', connecting: 'Conectando...', ringing: 'Chamando...', in_progress: 'Em ligação', completed: 'Ligação encerrada', failed: 'Falhou ao ligar', busy: 'Número ocupado', no_answer: 'Não atendeu', canceled: 'Cancelada' }
-const finished: CallStatus[] = ['completed', 'failed', 'busy', 'no_answer', 'canceled']
+const DRAG_STORAGE_KEY = 'cw-position'
+/** Arrasta o widget pelo cabeçalho (ignora cliques em botões) e lembra a posição entre ligações. */
+function useDraggableWidget() {
+  const [pos, setPos] = useState<{ left: number; top: number } | null>(() => {
+    try { const raw = localStorage.getItem(DRAG_STORAGE_KEY); return raw ? JSON.parse(raw) as { left: number; top: number } : null } catch { return null }
+  })
+  const drag = useRef<{ offsetX: number; offsetY: number; width: number; height: number } | null>(null)
+  const elementRef = useRef<HTMLElement | null>(null)
+
+  useEffect(() => {
+    function onMove(event: MouseEvent) {
+      if (!drag.current) return
+      const { offsetX, offsetY, width, height } = drag.current
+      const left = Math.min(Math.max(0, event.clientX - offsetX), window.innerWidth - width)
+      const top = Math.min(Math.max(0, event.clientY - offsetY), window.innerHeight - height)
+      setPos({ left, top })
+    }
+    function onUp() {
+      if (!drag.current) return
+      drag.current = null
+      setPos((current) => { try { if (current) localStorage.setItem(DRAG_STORAGE_KEY, JSON.stringify(current)) } catch { /* sem localStorage, sem persistência */ } return current })
+    }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+    return () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp) }
+  }, [])
+
+  function onHeaderMouseDown(event: ReactMouseEvent<HTMLElement>) {
+    if ((event.target as HTMLElement).closest('button')) return
+    const rect = elementRef.current?.getBoundingClientRect()
+    if (!rect) return
+    drag.current = { offsetX: event.clientX - rect.left, offsetY: event.clientY - rect.top, width: rect.width, height: rect.height }
+    setPos({ left: rect.left, top: rect.top })
+  }
+
+  return { ref: elementRef, style: pos ? { left: pos.left, top: pos.top, right: 'auto', bottom: 'auto' } as const : undefined, onHeaderMouseDown }
+}
+
+const statusText: Record<CallStatus, string> = { idle: 'Aguardando', connecting: 'Conectando...', ringing: 'Chamando...', in_progress: 'Em ligação', completed: 'Ligação encerrada', failed: 'Falhou ao ligar', busy: 'Número ocupado', no_answer: 'Não atendeu', canceled: 'Cancelada', voicemail: 'Caixa postal / URA' }
+const finished: CallStatus[] = ['completed', 'failed', 'busy', 'no_answer', 'canceled', 'voicemail']
 const weekdays = ['dom', 'seg', 'ter', 'qua', 'qui', 'sex', 'sáb']
 
 interface AppointmentMeta { date?: string; time?: string; specialty?: string; professional?: string; test?: boolean; kind?: string }
@@ -16,8 +54,9 @@ function clock(seconds: number) { const s = Math.max(0, seconds); return `${Stri
 function maskPhone(phone: string) { const d = phone.replace(/\D/g, '').replace(/^55/, ''); return d.length >= 10 ? `(${d.slice(0, 2)}) ${d.slice(2, d.length - 4)}-${d.slice(-4)}` : phone }
 
 /** Mini painel flutuante: mostra se a ligação está chamando e se a consulta foi confirmada, sem precisar ouvir. */
-export function CallWidget({ call, elapsed, demo, ending, takingOver, onTakeover, onEnd, onOpen, onClose, onRefresh }: { call: Call; elapsed: number; demo: boolean; ending: boolean; takingOver: boolean; onTakeover: () => void; onEnd: () => void; onOpen: () => void; onClose: () => void; onRefresh: () => void }) {
+export function CallWidget({ call, elapsed, demo, ending, takingOver, markingAnswered, markingVoicemail, onTakeover, onEnd, onMarkAnswered, onMarkVoicemail, onOpen, onClose, onRefresh }: { call: Call; elapsed: number; demo: boolean; ending: boolean; takingOver: boolean; markingAnswered: boolean; markingVoicemail: boolean; onTakeover: () => void; onEnd: () => void; onMarkAnswered: () => void; onMarkVoicemail: () => void; onOpen: () => void; onClose: () => void; onRefresh: () => void }) {
   const done = finished.includes(call.status)
+  const drag = useDraggableWidget()
   // Depois que a ligação acaba, relê mais duas vezes para pegar o resultado gravado no final.
   useEffect(() => {
     if (!done) return
@@ -45,8 +84,8 @@ export function CallWidget({ call, elapsed, demo, ending, takingOver, onTakeover
   else if (done && call.status === 'completed') result = <span className="cw-result idle">{isMissed ? 'Encerrou sem registrar resultado' : 'Encerrou sem confirmar nem desmarcar'}</span>
   else if (done) result = <span className="cw-result idle"><PhoneOff size={14}/> {statusText[call.status]}</span>
 
-  return <aside className={`call-widget cw-${tone}`} role="status" aria-live="polite">
-    <header>
+  return <aside ref={drag.ref} className={`call-widget cw-${tone}`} style={drag.style} role="status" aria-live="polite">
+    <header className="cw-drag-handle" onMouseDown={drag.onHeaderMouseDown}>
       <span className={`cw-dot ${done ? '' : 'pulse'}`}/>
       <strong>{statusText[call.status]}</strong>
       {talking && <span className="cw-time">{clock(elapsed)}</span>}
@@ -63,6 +102,8 @@ export function CallWidget({ call, elapsed, demo, ending, takingOver, onTakeover
     </div>
     {!done && <div className="cw-actions">
       {!demo && <LiveListen compact callId={call.id} active={!done} humanTakeover={human}/>}
+      {talking && !human && <button className="cw-act cw-act-take" disabled={markingAnswered} title="Use se perceber que a pessoa atendeu e está falando, mas a Giovana continua muda" onClick={onMarkAnswered}><PhoneCall size={13}/>{markingAnswered ? 'Avisando...' : 'Atendeu'}</button>}
+      {talking && !human && <button className="cw-act cw-act-take" disabled={markingVoicemail} title="Use se perceber que caiu na caixa postal/gravação: desliga e já manda o WhatsApp de confirmação" onClick={onMarkVoicemail}><PhoneOff size={13}/>{markingVoicemail ? 'Marcando...' : 'Caixa postal'}</button>}
       <button className="cw-act cw-act-take" disabled={human || takingOver} onClick={onTakeover}><Hand size={13}/>{human ? 'Assumida' : takingOver ? 'Assumindo...' : 'Assumir'}</button>
       <button className="cw-act cw-act-end" disabled={ending} onClick={onEnd}><PhoneOff size={13}/>{ending ? 'Encerrando...' : 'Encerrar'}</button>
     </div>}

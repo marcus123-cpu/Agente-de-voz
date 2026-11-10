@@ -11,6 +11,7 @@ import { chromium, type Browser, type Page, type WebSocket as PlaywrightWebSocke
 import WebSocket, { WebSocketServer } from 'ws';
 import { config } from './config.js';
 import type { CallStatus } from './types.js';
+import { SELF_TALK_PATTERNS } from './self-talk-patterns.js';
 
 const TENANT_PAGE = config.cvortexUrl;
 const TENANT_ORIGIN = new URL(TENANT_PAGE).origin;
@@ -28,7 +29,7 @@ export interface CvortexStartOptions {
   callId: string;
   phone: string;
   patientName: string;
-  contactContext: 'not_informed' | 'recent_card_member' | 'appointment_confirmation' | 'missed_appointment';
+  contactContext: 'not_informed' | 'recent_card_member' | 'appointment_confirmation' | 'missed_appointment' | 'waitlist_capture';
   agentId: string;
   /** Modelos de WhatsApp que a IA pode enviar (vira a variável {{modelos_whatsapp}} do prompt). */
   whatsappModels?: string;
@@ -43,7 +44,7 @@ export interface CvortexStartOptions {
   onStatus?: (status: CallStatus) => void | Promise<void>;
   onAgentConnected?: () => void | Promise<void>;
   onConversationId?: (conversationId: string) => void | Promise<void>;
-  onEnded?: (status: 'completed' | 'failed') => void | Promise<void>;
+  onEnded?: (status: CallStatus) => void | Promise<void>;
   /** Escuta ao vivo (PCM16 16 kHz mono). Chamado de forma síncrona e barata. */
   onAudio?: (source: 'patient' | 'agent', pcm: Buffer) => void;
   onText?: (role: 'patient' | 'agent', text: string, correction?: boolean) => void;
@@ -72,11 +73,72 @@ interface Session {
   missingCallControlTicks: number;
   monitor: ReturnType<typeof setInterval> | null;
   mediaTimer: ReturnType<typeof setTimeout> | null;
+  // A ponte WebRTC autentica (e manda {type:'start'}) ainda durante o toque, porque o PeerConnection do
+  // webphone já fica "connected" com ringback fluindo antes de alguém atender de verdade — por isso NÃO
+  // basta esse sinal pra conectar a Giovana. Só chamamos a ElevenLabs quando este E patientConnected (abaixo)
+  // forem true (ver tryConnectAgent).
+  bridgeReady: boolean;
+  // Confirmado via DOM real do webphone (ver watchPatientConnected): a barra do cVortex troca o texto
+  // "chamando..." por um cronômetro HH:MM:SS só quando a chamada conecta de verdade (atendida, inclusive
+  // caixa postal/URA — não dá pra distinguir isso só por aqui). Esse é o sinal de atendimento real que faltava.
+  patientConnected: boolean;
+  connectWatcher: ReturnType<typeof setInterval> | null;
+  // Áudio do paciente chegado antes da ponte/agente ficarem prontos (ex.: ele já diz "alô" no instante
+  // em que atende). Sem isso esse trecho é descartado e a primeira fala chega cortada para a Giovana.
+  pendingPatientAudio: Buffer[];
+  pendingPatientAudioBytes: number;
+  // Se o paciente chegou a dizer alguma palavra de verdade reconhecida (não "...", ruído ou vazio).
+  // Usado pra decidir, quando a ligação acaba sozinha (ninguém mais no controle do webphone), se foi
+  // "não atendeu" (nunca ouvimos nada) ou "completed" normal (teve conversa de verdade).
+  patientSaidSomething: boolean;
+  // Rede de segurança estrutural: investigação confirmou (transcrições reais) que ela às vezes ainda gera
+  // a fala proibida de "autoconversa" (ex.: "tem alguém aí?") mesmo com toda a instrução de prompt — parece
+  // reengajamento forçado pelo motor de turno da ElevenLabs, não desobediência ao prompt. Setado true assim
+  // que o TEXTO da fala bate nos padrões proibidos (chega antes do áudio da TTS); enquanto true, o áudio
+  // correspondente é tocado só pra escuta/revisão interna (onAudio), nunca mandado pro paciente de verdade.
+  suppressAgentAudio: boolean;
 }
+// ~4s de áudio pcm_16000 mono (16000 amostras/s * 2 bytes). Suficiente para um "alô" ou "oi" não se perder
+// enquanto a ponte/agente terminam de ficar prontos, sem acumular áudio indefinidamente se travar.
+const MAX_PENDING_PATIENT_AUDIO = 128_000;
 
 function fire(callback: (() => void | Promise<void>) | undefined): void {
   if (!callback) return;
   Promise.resolve().then(callback).catch(error => console.error('[CVORTEX] callback failed', error));
+}
+/** Pronto para mandar áudio do paciente pra Giovana (ponte e agente ElevenLabs já alinhados). */
+function patientAudioReady(session: Session): boolean {
+  return session.mediaReady && session.inputFormat === 'pcm_16000' && session.agentSocket?.readyState === WebSocket.OPEN;
+}
+/** Manda um chunk de áudio do paciente pra Giovana (ou guarda, se ela ainda não está pronta pra ouvir). */
+function sendPatientAudio(session: Session, chunk: Buffer): void {
+  // Sempre tenta esvaziar o que ficou pendente ANTES deste chunk, pra manter a ordem e pra um pico de
+  // backpressure no meio da ligação (ex.: bufferedAmount passou de MAX_BUFFERED por um instante) não deixar
+  // a fala do paciente ("sim", "tá ligado?") perdida pra sempre — sem isso ela só era esvaziada no começo
+  // da ligação (media-ready/conversation_initiation_metadata) e nunca mais, então a Giovana simplesmente
+  // nunca recebia aquele trecho e ficava muda até o paciente falar de novo.
+  if (patientAudioReady(session)) flushPendingPatientAudio(session);
+  if (patientAudioReady(session) && session.agentSocket!.bufferedAmount < MAX_BUFFERED) {
+    session.agentSocket!.send(JSON.stringify({ user_audio_chunk: chunk.toString('base64') }));
+  } else if (!session.ended && !session.ending) {
+    session.pendingPatientAudio.push(chunk);
+    session.pendingPatientAudioBytes += chunk.length;
+    while (session.pendingPatientAudioBytes > MAX_PENDING_PATIENT_AUDIO && session.pendingPatientAudio.length > 1) {
+      const dropped = session.pendingPatientAudio.shift()!;
+      session.pendingPatientAudioBytes -= dropped.length;
+    }
+  }
+  try { session.options.onAudio?.('patient', chunk); } catch { /* escuta nunca derruba a ligação */ }
+}
+/** Chamado quando a ponte e o agente ficam prontos: esvazia o que o paciente já tinha falado, na ordem. */
+function flushPendingPatientAudio(session: Session): void {
+  if (!patientAudioReady(session) || !session.pendingPatientAudio.length) return;
+  const pending = session.pendingPatientAudio;
+  session.pendingPatientAudio = []; session.pendingPatientAudioBytes = 0;
+  for (const chunk of pending) {
+    if (!patientAudioReady(session) || session.agentSocket!.bufferedAmount >= MAX_BUFFERED) break;
+    session.agentSocket!.send(JSON.stringify({ user_audio_chunk: chunk.toString('base64') }));
+  }
 }
 function fireStatus(session: Session, status: CallStatus): void { fire(() => session.options.onStatus?.(status)); }
 /** Saudação conforme o horário de Brasília, usada na abertura da Giovana. */
@@ -101,6 +163,7 @@ class CvortexBrowserProvider {
   private instrumented = false;
   private active: Session | null = null;
   private browserLaunchRequested = false;
+  private lastBrowserLaunchAttempt = 0;
 
   async connectionStatus(): Promise<{ browserOpen: boolean; loggedIn: boolean; activeCall: boolean }> {
     try {
@@ -122,26 +185,34 @@ class CvortexBrowserProvider {
   }
 
   async ready(): Promise<boolean> {
+    // Só checa o status; não tenta abrir o navegador sozinho (isso é feito só pelo botão "Abrir cVortex",
+    // via openBrowser). O painel chama isso a cada poucos segundos, então uma tentativa automática aqui
+    // vira um loop de tentativas falhando sem parar sempre que o Chrome não está pronto.
     try {
       const page = await this.getPage();
       if (page.isClosed() || !page.url().startsWith(TENANT_ORIGIN)) return false;
       const hasToolbar = await page.getByRole('button', { name: 'Pausa' }).count() > 0;
       const hasActiveCall = await page.locator('svg[aria-label="Call End"]').count() > 0;
       return hasToolbar && !hasActiveCall && !this.active;
-    } catch (error) {
-      if (error instanceof Error && /ECONNREFUSED|ERR_CONNECTION_REFUSED|connectOverCDP.*closed/i.test(error.message)) this.launchBrowser();
+    } catch {
       return false;
     }
   }
 
   private launchBrowser(): void {
     if (this.browserLaunchRequested) return;
+    // Evita tentar de novo em loop (ex.: o painel fica checando a conexão a cada poucos segundos):
+    // só tenta de novo depois de um tempo, mesmo que a tentativa anterior já tenha terminado.
+    if (Date.now() - this.lastBrowserLaunchAttempt < 20_000) return;
+    this.lastBrowserLaunchAttempt = Date.now();
     this.browserLaunchRequested = true;
     const script = fileURLToPath(new URL('../../tools/cvortex-browser.mjs', import.meta.url));
     try {
-      const child = spawn(process.execPath, [script], { detached: true, stdio: 'ignore', windowsHide: false });
+      const child = spawn(process.execPath, [script], { detached: true, stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true });
+      let stderr = '';
+      child.stderr?.on('data', chunk => { stderr += chunk.toString(); });
       child.on('error', error => { this.browserLaunchRequested = false; console.error('[CVORTEX] navegador não iniciou:', error.message); });
-      child.on('exit', () => { this.browserLaunchRequested = false; });
+      child.on('exit', code => { this.browserLaunchRequested = false; if (code) console.error('[CVORTEX] navegador não iniciou (código', code, '):', stderr.trim() || 'sem detalhes'); });
       child.unref();
     } catch (error) {
       this.browserLaunchRequested = false;
@@ -216,7 +287,7 @@ class CvortexBrowserProvider {
     const page = await this.getPage();
     if (await page.locator('svg[aria-label="Call End"]').count()) throw new Error('Há uma chamada ativa no webphone.');
     await this.instrument(page);
-    const session: Session = { options, page, nonce: randomBytes(32), server: null, browserSocket: null, agentSocket: null, accepted: false, mediaReady: false, ended: false, ending: false, takenOver: false, callControlSeen: false, missingCallControlTicks: 0, monitor: null, mediaTimer: null, conversationId: null, inputFormat: null, outputFormat: null, startedAt: Date.now() };
+    const session: Session = { options, page, nonce: randomBytes(32), server: null, browserSocket: null, agentSocket: null, accepted: false, mediaReady: false, ended: false, ending: false, takenOver: false, callControlSeen: false, missingCallControlTicks: 0, monitor: null, mediaTimer: null, conversationId: null, inputFormat: null, outputFormat: null, startedAt: Date.now(), pendingPatientAudio: [], pendingPatientAudioBytes: 0, patientSaidSomething: false, suppressAgentAudio: false, bridgeReady: false, patientConnected: false, connectWatcher: null };
     this.active = session;
     fireStatus(session, 'connecting');
     let clicked = false;
@@ -245,6 +316,7 @@ class CvortexBrowserProvider {
       }
       session.accepted = true;
       this.monitorCall(session);
+      this.watchPatientConnected(session);
       void this.startBridge(session).catch(error => this.bridgeFailed(session, error));
     } catch (error) {
       if (clicked && !rejected) {
@@ -267,12 +339,56 @@ class CvortexBrowserProvider {
           session.missingCallControlTicks++;
           if (session.missingCallControlTicks >= 3) {
             console.info('[CVORTEX] controle ausente por 3 verificações; chamada encerrada', session.options.callId);
-            void this.finish(session, 'completed');
+            // Ninguém mexeu em nada (nem operador nem Giovana): se o paciente nunca disse uma palavra de
+            // verdade a ligação inteira, foi "não atendeu" de verdade (silêncio do início ao fim), não um
+            // "completed" normal — isso já dispara o WhatsApp de confirmação sozinho.
+            void this.finish(session, session.patientSaidSomething ? 'completed' : 'no_answer');
           }
         }
       }).catch(() => undefined);
     }, 1000);
     session.monitor.unref?.();
+  }
+
+  /**
+   * Detecta atendimento real pela própria UI do webphone: a barra ao lado do botão de desligar mostra
+   * "chamando..." durante o toque e troca para um cronômetro HH:MM:SS só quando a chamada conecta de
+   * verdade (confirmado com ligação real em 2026-11-10). Usa o PADRÃO do texto (regex), não nomes de
+   * classe CSS do cVortex (MUI/styled-components gera hashes que mudam a cada build deles).
+   * Limitação aceita por ora: caixa postal/URA também faz esse cronômetro aparecer (o cVortex não
+   * distingue isso na UI) — segue coberta pelo botão manual "Caixa postal" e pela detecção de texto
+   * de voicemail_detection já existentes.
+   */
+  private watchPatientConnected(session: Session): void {
+    session.connectWatcher = setInterval(() => {
+      if (session.patientConnected || session.ended || session.ending) { if (session.connectWatcher) clearInterval(session.connectWatcher); return; }
+      void session.page.evaluate(() => {
+        const icon = document.querySelector('svg[aria-label="Call End"]');
+        if (!icon) return null;
+        let el: Element | null = icon;
+        for (let i = 0; i < 7 && el; i++) el = el.parentElement;
+        return el ? el.textContent : null;
+      }).then(text => {
+        if (session.patientConnected || !text) return;
+        if (/\d{1,2}:\d{2}:\d{2}/.test(text)) {
+          session.patientConnected = true;
+          if (session.connectWatcher) clearInterval(session.connectWatcher);
+          console.info('[CVORTEX] atendimento real confirmado pelo cronômetro do webphone', session.options.callId);
+          this.tryConnectAgent(session);
+        }
+      }).catch(() => undefined);
+    }, 400);
+    session.connectWatcher.unref?.();
+  }
+
+  /** Só conecta a Giovana quando a ponte de áudio JÁ autenticou E o cVortex confirmou atendimento real. */
+  private tryConnectAgent(session: Session): void {
+    if (!session.bridgeReady || !session.patientConnected || session.agentSocket || session.ended || session.takenOver) return;
+    session.mediaTimer = setTimeout(() => {
+      if (!session.mediaReady && !session.ending && !session.ended) void this.bridgeFailed(session, new Error('A ponte de áudio não ficou pronta dentro do prazo.'));
+    }, 20_000);
+    session.mediaTimer.unref?.();
+    void this.connectAgent(session).catch(error => this.bridgeFailed(session, error));
   }
 
   private async startBridge(session: Session): Promise<void> {
@@ -318,7 +434,7 @@ class CvortexBrowserProvider {
       const unmuteLocal = () => { clearInterval(muteTimer); touched.forEach(media => { try { media.muted = false; } catch { /* removido */ } }); touched.clear(); };
       const restore = async () => {
         if (w.__cvActiveBridge?.socket !== socket) { unmuteLocal(); return sender.track === microphone; }
-        unmuteLocal(); if (gateTimer) clearTimeout(gateTimer);
+        unmuteLocal();
         try { if (sender.track !== microphone) await sender.replaceTrack(microphone); microphone.enabled = microphoneWasEnabled; } catch { return false; }
         if (sender.track !== microphone) return false;
         w.__cvActiveBridge = null;
@@ -329,32 +445,19 @@ class CvortexBrowserProvider {
         return true;
       };
       w.__cvActiveBridge = { socket, restore };
-      // Só chama a IA (e gasta crédito) depois que o paciente atender. Durante o toque a trilha recebida traz o
-      // sinal de chamando (tom puro de ~425 Hz, taxa de cruzamentos por zero quase constante); a fala tem
-      // energia com cruzamentos bem diferentes. Se nada for detectado em 40 s, segue assim mesmo.
+      // Antes, tentávamos adivinhar "o paciente atendeu" analisando volume/frequência do áudio recebido
+      // (distinguir tom de chamada de fala) — um heurístico caseiro que ou demorava demais, ou disparava
+      // com ruído da linha. Agora conectamos a Giovana assim que a ponte autentica, mas com first_message
+      // vazio: ela fica muda e só fala depois que o reconhecimento de voz de verdade da ElevenLabs (bem
+      // mais confiável) perceber a pessoa falando (ex. "alô"). Ela também nunca fala sozinha porque o
+      // prompt da ligação já instrui "espere a pessoa falar primeiro".
       let gateOpen = false;
-      let speechFrames: number[] = [];
-      let gateTimer: ReturnType<typeof setTimeout> | null = null;
       const openGate = () => {
         if (gateOpen) return;
         gateOpen = true;
-        if (gateTimer) clearTimeout(gateTimer);
         if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'start' }));
       };
-      const armAnswerGate = () => { gateTimer = setTimeout(openGate, 40000); };
-      const detectAnswer = (samples: Float32Array) => {
-        if (gateOpen) return;
-        let sum = 0, crossings = 0;
-        for (let i = 0; i < samples.length; i++) { const v = samples[i]!; sum += v * v; if (i && (v >= 0) !== (samples[i - 1]! >= 0)) crossings++; }
-        const rms = Math.sqrt(sum / samples.length);
-        const rate = crossings * context.sampleRate / samples.length;   // cruzamentos por segundo (tom de 425 Hz ≈ 850)
-        const now = performance.now();
-        if (rms > 0.004 && Math.abs(rate - 850) > 180) speechFrames.push(now);
-        speechFrames = speechFrames.filter(t => now - t < 1500);
-        if (speechFrames.length >= 3) openGate();
-      };
       processor.onaudioprocess = event => {
-        if (authenticated && !gateOpen) detectAnswer(event.inputBuffer.getChannelData(0));
         if (!authenticated || !sending || socket.readyState !== WebSocket.OPEN || socket.bufferedAmount > 512000) return;
         const samples = event.inputBuffer.getChannelData(0);
         const inputRate = context.sampleRate;
@@ -373,7 +476,7 @@ class CvortexBrowserProvider {
         if (typeof event.data === 'string') {
           let control: { type?: string };
           try { control = JSON.parse(event.data) as { type?: string }; } catch { return; }
-          if (control.type === 'hello-ok') { authenticated = true; armAnswerGate(); }
+          if (control.type === 'hello-ok') { authenticated = true; openGate(); }
           if (control.type === 'agent-ready') {
             try {
               await sender.replaceTrack(output.stream.getAudioTracks()[0]!);
@@ -436,28 +539,24 @@ class CvortexBrowserProvider {
         return;
       }
       if (binary) {
-        if (session.mediaReady && session.inputFormat === 'pcm_16000' && session.agentSocket?.readyState === WebSocket.OPEN && session.agentSocket.bufferedAmount < MAX_BUFFERED) {
-          session.agentSocket.send(JSON.stringify({ user_audio_chunk: Buffer.from(payload as Buffer).toString('base64') }));
-          try { session.options.onAudio?.('patient', Buffer.from(payload as Buffer)); } catch { /* escuta nunca derruba a ligação */ }
-        }
+        sendPatientAudio(session, Buffer.from(payload as Buffer));
         return;
       }
       let message: { type?: string } = {};
       try { message = JSON.parse(payload.toString()) as typeof message; } catch { return; }
       if (message.type === 'start' && !session.takenOver) {
-        console.info('[CVORTEX] paciente atendeu (voz detectada); conectando a Giovana', session.options.callId);
-        // O prazo de 20 s só conta depois que o paciente atende; durante o toque a IA nem é chamada.
-        session.mediaTimer = setTimeout(() => {
-          if (!session.mediaReady && !session.ending && !session.ended) void this.bridgeFailed(session, new Error('A ponte de áudio não ficou pronta dentro do prazo.'));
-        }, 20_000);
-        session.mediaTimer.unref?.();
+        // A ponte WebRTC autentica aqui ainda durante o toque (ringback já conectou o PeerConnection).
+        // NÃO liga a Giovana ainda — só quando watchPatientConnected confirmar atendimento real (ver tryConnectAgent).
+        console.info('[CVORTEX] ponte de áudio pronta; aguardando confirmação de atendimento real antes de conectar a Giovana', session.options.callId);
+        session.bridgeReady = true;
+        this.tryConnectAgent(session);
       }
-      if (message.type === 'start' && !session.takenOver) void this.connectAgent(session).catch(error => this.bridgeFailed(session, error));
       if (message.type === 'media-ready') {
         session.mediaReady = true;
         if (session.mediaTimer) clearTimeout(session.mediaTimer);
         fire(() => session.options.onAgentConnected?.());
         fireStatus(session, 'in_progress');
+        flushPendingPatientAudio(session);
       }
       if (message.type === 'media-error') void this.bridgeFailed(session, new Error('Não foi possível trocar a track de saída.'));
     });
@@ -476,7 +575,13 @@ class CvortexBrowserProvider {
     const agent = new WebSocket(data.signed_url);
     session.agentSocket = agent;
     agent.on('open', () => {
-      agent.send(JSON.stringify({ type: 'conversation_initiation_client_data', dynamic_variables: { patient_name: session.options.patientName, contact_context: session.options.contactContext, saudacao: greetingForNow(), modelos_whatsapp: session.options.whatsappModels ?? 'nenhum', agenda_amei: session.options.ameiAgenda ?? 'indisponivel', ...(session.options.extraVariables ?? {}) }, ...(session.options.promptOverride ? { conversation_config_override: { agent: { prompt: { prompt: session.options.promptOverride }, ...(session.options.firstMessageOverride ? { first_message: session.options.firstMessageOverride } : {}) } } } : {}) }));
+      // prompt e first_message são independentes: mesmo sem roteiro específico (ligação manual/
+      // captação geral), ainda mandamos first_message="" para ela esperar a pessoa falar primeiro.
+      const agentOverride: Record<string, unknown> = {};
+      if (session.options.promptOverride) agentOverride.prompt = { prompt: session.options.promptOverride };
+      if (session.options.firstMessageOverride !== undefined) agentOverride.first_message = session.options.firstMessageOverride;
+      else agentOverride.first_message = '';
+      agent.send(JSON.stringify({ type: 'conversation_initiation_client_data', dynamic_variables: { patient_name: session.options.patientName, contact_context: session.options.contactContext, saudacao: greetingForNow(), modelos_whatsapp: session.options.whatsappModels ?? 'nenhum', agenda_amei: session.options.ameiAgenda ?? 'indisponivel', ...(session.options.extraVariables ?? {}) }, conversation_config_override: { agent: agentOverride } }));
     });
     agent.on('message', payload => {
       let message: any;
@@ -488,6 +593,7 @@ class CvortexBrowserProvider {
         if (session.conversationId) fire(() => session.options.onConversationId?.(session.conversationId!));
         if (session.inputFormat !== 'pcm_16000' || session.outputFormat !== 'pcm_16000') { void this.bridgeFailed(session, new Error('Formato de áudio ElevenLabs não suportado nesta PoC.')); return; }
         if (session.browserSocket?.readyState === WebSocket.OPEN) session.browserSocket.send(JSON.stringify({ type: 'agent-ready' }));
+        flushPendingPatientAudio(session);
       }
       if (message.type === 'ping' && message.ping_event?.event_id != null && agent.readyState === WebSocket.OPEN) agent.send(JSON.stringify({ type: 'pong', event_id: message.ping_event.event_id }));
       if (message.type === 'client_tool_call' && message.client_tool_call?.tool_call_id) {
@@ -502,19 +608,60 @@ class CvortexBrowserProvider {
         try { session.options.onFlush?.(); } catch { /* escuta nunca derruba a ligação */ }
         if (session.browserSocket?.readyState === WebSocket.OPEN) session.browserSocket.send(JSON.stringify({ type: 'interruption' }));
       }
-      if (message.type === 'audio' && message.audio_event?.audio_base_64 && session.outputFormat === 'pcm_16000' && session.browserSocket?.readyState === WebSocket.OPEN) {
+      if (message.type === 'audio' && message.audio_event?.audio_base_64 && session.outputFormat === 'pcm_16000') {
         const pcm = Buffer.from(message.audio_event.audio_base_64, 'base64');
-        session.browserSocket.send(pcm, { binary: true });
+        // Rede de segurança: se o texto desta fala já bateu em SELF_TALK_PATTERNS (visto no agent_response,
+        // que chega antes do áudio da TTS), o paciente nunca ouve — só fica registrado pra escuta/revisão.
+        if (!session.suppressAgentAudio && session.browserSocket?.readyState === WebSocket.OPEN) session.browserSocket.send(pcm, { binary: true });
         try { session.options.onAudio?.('agent', pcm); } catch { /* escuta nunca derruba a ligação */ }
       }
       try {
-        if (message.type === 'user_transcript' && message.user_transcription_event?.user_transcript) session.options.onText?.('patient', String(message.user_transcription_event.user_transcript));
-        if (message.type === 'agent_response' && message.agent_response_event?.agent_response) session.options.onText?.('agent', String(message.agent_response_event.agent_response));
+        if (message.type === 'user_transcript' && message.user_transcription_event?.user_transcript) {
+          const patientText = String(message.user_transcription_event.user_transcript);
+          // Mesmo critério do roteiro: só conta como "o paciente falou de verdade" quando tem letras de
+          // verdade (não é "...", ruído ou vazio) — usado pra classificar sozinho "não atendeu" depois.
+          if (/\p{L}{2,}/u.test(patientText)) session.patientSaidSomething = true;
+          session.options.onText?.('patient', patientText);
+        }
+        if (message.type === 'agent_response' && message.agent_response_event?.agent_response) {
+          const agentText = String(message.agent_response_event.agent_response);
+          // Regra estrutural (pega qualquer frase nova que a gente nunca viu, não só as já catalogadas):
+          // antes do paciente ter dito uma palavra de verdade nesta ligação, ela só pode ficar muda ou
+          // dizer um "Alô?" bem curto (ver roteiro). Qualquer coisa mais longa que isso nessa fase já é
+          // errado por definição, não importa a frase exata — não depende de reconhecer o texto específico.
+          const tooLongBeforeRealSpeech = !session.patientSaidSomething && agentText.trim().split(/\s+/).filter(Boolean).length > 6;
+          // Reseta a cada fala nova: só suprime o áudio DESTA fala proibida, nunca a próxima.
+          session.suppressAgentAudio = tooLongBeforeRealSpeech || SELF_TALK_PATTERNS.some(pattern => pattern.test(agentText));
+          if (session.suppressAgentAudio) console.info('[CVORTEX] fala proibida detectada; áudio não vai pro paciente', session.options.callId, tooLongBeforeRealSpeech ? '(fala longa antes de ouvir o paciente)' : '(bateu num padrão conhecido)', JSON.stringify(agentText));
+          // A Giovana deve chamar a ferramenta voicemail_detection assim que reconhecer uma gravação/URA.
+          // A ElevenLabs registra isso como se fosse uma "fala" com o nome da ferramenta — detecta isso
+          // aqui pra encerrar sozinho e já marcar a ligação como caixa postal (dispara o WhatsApp sozinho),
+          // sem precisar que o operador clique no botão manual. Best-effort: se a forma de registrar mudar
+          // na ElevenLabs, isso só deixa de disparar — o botão manual continua funcionando do mesmo jeito.
+          if (/voicemail_detection/i.test(agentText) && !session.ending && !session.ended) {
+            console.info('[CVORTEX] voicemail_detection detectado; encerrando e marcando caixa postal', session.options.callId);
+            void this.end(session.options.callId, 'voicemail').catch(error => console.error('[CVORTEX] encerramento automático de caixa postal falhou:', error));
+          }
+          session.options.onText?.('agent', agentText);
+        }
         if (message.type === 'agent_response_correction' && message.agent_response_correction_event?.corrected_agent_response) session.options.onText?.('agent', String(message.agent_response_correction_event.corrected_agent_response), true);
       } catch { /* escuta nunca derruba a ligação */ }
     });
     agent.on('error', () => { if (!session.ending && !session.ended && !session.takenOver) void this.bridgeFailed(session, new Error('WebSocket ElevenLabs falhou.')); });
-    agent.on('close', () => { if (!session.ending && !session.ended && !session.takenOver) void this.bridgeFailed(session, new Error('WebSocket ElevenLabs fechou.')); });
+    agent.on('close', code => {
+      if (session.ending || session.ended || session.takenOver) return;
+      // Giovana encerra a ligação com a ferramenta end_call dela mesma: a ElevenLabs fecha esse socket
+      // de forma normal (code 1000) quando isso acontece, antes de qualquer coisa dar errado. Sem
+      // distinguir isso, toda ligação que terminou do jeito certo ficava marcada como "falhou".
+      if (code === 1000) {
+        void this.end(session.options.callId, 'completed').catch(error => {
+          console.error('[CVORTEX] encerramento normal não confirmado:', error);
+          void this.bridgeFailed(session, error instanceof Error ? error : new Error('Encerramento não confirmado.'));
+        });
+      } else {
+        void this.bridgeFailed(session, new Error(`WebSocket ElevenLabs fechou (code ${code}).`));
+      }
+    });
   }
 
   private async bridgeFailed(session: Session, error: unknown): Promise<void> {
@@ -526,7 +673,7 @@ class CvortexBrowserProvider {
     });
   }
 
-  async end(callId: string, terminal: 'completed' | 'failed' = 'completed'): Promise<void> {
+  async end(callId: string, terminal: CallStatus = 'completed'): Promise<void> {
     const session = this.active;
     if (!session || session.options.callId !== callId || session.ended) return;
     if (session.ending) return;
@@ -549,6 +696,17 @@ class CvortexBrowserProvider {
       session.ending = false;
       throw error;
     }
+  }
+
+  /** Botão "Atendeu": o cVortex não tem como avisar com certeza quando a pessoa atendeu de verdade (sem
+   * contrato com o fornecedor), então quando o operador PERCEBE que atendeu mas a Giovana ainda está muda
+   * (esperando "palavras de verdade" que o reconhecimento de voz não pegou), isso simula a pessoa tendo dito
+   * "alô" — ela reage e segue o roteiro normal a partir daí, do mesmo jeito que reagiria a um "alô" real. */
+  async markAnswered(callId: string): Promise<void> {
+    const session = this.active;
+    if (!session || session.options.callId !== callId || session.ended || session.ending) throw new Error('Ligação ativa não encontrada no webphone.');
+    if (session.agentSocket?.readyState !== WebSocket.OPEN) throw new Error('A Giovana ainda não está conectada nesta ligação.');
+    session.agentSocket.send(JSON.stringify({ type: 'user_message', text: 'Alô' }));
   }
 
   async takeover(callId: string): Promise<void> {
@@ -591,11 +749,12 @@ class CvortexBrowserProvider {
     session.server = null;
   }
 
-  private async finish(session: Session, status: 'completed' | 'failed'): Promise<void> {
+  private async finish(session: Session, status: CallStatus): Promise<void> {
     if (session.ended) return;
     session.ended = true;
     session.ending = true;
     if (session.monitor) clearInterval(session.monitor);
+    if (session.connectWatcher) clearInterval(session.connectWatcher);
     if (session.mediaTimer) clearTimeout(session.mediaTimer);
     await this.stopBridge(session);
     if (this.active === session) this.active = null;
@@ -609,6 +768,7 @@ export interface CvortexProviderAdapter {
   start(options: CvortexStartOptions): Promise<void>;
   end(callId: string): Promise<void>;
   takeover(callId: string): Promise<void>;
+  markAnswered(callId: string): Promise<void>;
   connectionStatus?(): Promise<{ browserOpen: boolean; loggedIn: boolean; activeCall: boolean }>;
   openBrowser?(): Promise<void>;
 }
@@ -619,5 +779,6 @@ export const cvortexReady = (): Promise<boolean> => provider.ready();
 export const startCvortexCall = (options: CvortexStartOptions): Promise<void> => provider.start(options);
 export const endCvortexCall = (callId: string): Promise<void> => provider.end(callId);
 export const takeoverCvortexCall = (callId: string): Promise<void> => provider.takeover(callId);
+export const markCvortexCallAnswered = (callId: string): Promise<void> => provider.markAnswered(callId);
 export const cvortexConnectionStatus = (): Promise<{ browserOpen: boolean; loggedIn: boolean; activeCall: boolean }> => provider.connectionStatus?.() ?? Promise.resolve({ browserOpen: false, loggedIn: false, activeCall: false });
 export const openCvortexBrowser = (): Promise<void> => provider.openBrowser?.() ?? Promise.reject(new Error('Abertura do navegador indisponível.'));

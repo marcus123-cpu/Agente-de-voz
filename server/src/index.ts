@@ -10,9 +10,9 @@ import * as repo from './repository.js';
 import { CallEventsService } from './monitor.js';
 import { cvortexConnectionStatus, cvortexReady, openCvortexBrowser } from './cvortex-provider.js';
 import { openWhatsapp, whatsappStatus } from './whatsapp.js';
-import { ameiStatus, openAmei, ameiConfirmList, ameiConfirmOptions, ameiProfessionalsOf, AmeiError } from './amei.js';
+import { ameiStatus, openAmei, ameiConfirmList, ameiConfirmOptions, ameiProfessionalsOf, ameiRecoveryStatusOf, startCampaignSearch, getCampaignSearch, type CampaignMode, AmeiError } from './amei.js';
 import { connectElevenLabs, connectionDetails, disconnectElevenLabs } from './connections.js';
-import { PublicError, startConfirmationCall, startTestConfirmationCall, startMissedCall, startTestMissedCall, normalizePhone, sendTestWhatsapp, endCall, getManagedCall, getManagedCallByConversationId, listManagedCalls, saveResult, startCall, syncCall, takeoverCall, updateStatus } from './services.js';
+import { PublicError, startConfirmationCall, startTestConfirmationCall, startMissedCall, startWaitlistCall, startTestMissedCall, startTestWaitlistCall, startAutoConfirm, stopAutoConfirm, autoConfirmStatus, normalizePhone, sendTestWhatsapp, endCall, getCallAudio, getCallTranscript, getManagedCall, getManagedCallByConversationId, listManagedCalls, markCallAnswered, markCallVoicemail, saveResult, startCall, syncCall, takeoverCall, updateStatus } from './services.js';
 import type { CallResult, ContactSource } from './types.js';
 
 const app=express();
@@ -42,7 +42,7 @@ app.post('/api/webhooks/elevenlabs',express.raw({type:'application/json',limit:'
   if(!config.elevenLabsWebhookSecret || !timestamp || !mac || Math.abs(Date.now()-Number(timestamp)*1000)>30*60*1000 || !Buffer.isBuffer(req.body)) {res.status(401).end();return;}
   const expected=createHmac('sha256',config.elevenLabsWebhookSecret).update(`${timestamp}.${req.body.toString('utf8')}`).digest('hex');
   if(mac.length!==expected.length || !timingSafeEqual(Buffer.from(mac),Buffer.from(expected))) {res.status(401).end();return;}
-  const event=JSON.parse(req.body.toString('utf8')) as {type?:string;data?:{conversation_id?:string;analysis?:{transcript_summary?:string};failure_reason?:string}};
+  const event=JSON.parse(req.body.toString('utf8')) as {type?:string;data?:{conversation_id?:string;analysis?:{transcript_summary?:string};failure_reason?:string;metadata?:{features_usage?:{voicemail_detection?:{used?:boolean}}}}};
   const conversationId=event.data?.conversation_id;
   if(conversationId) {
     const call=await getManagedCallByConversationId(conversationId);
@@ -50,7 +50,10 @@ app.post('/api/webhooks/elevenlabs',express.raw({type:'application/json',limit:'
       if(event.type==='post_call_transcription') {
         const summary=event.data?.analysis?.transcript_summary;
         if(typeof summary==='string' && summary.trim()) await repo.updateCall(call.id,{summary:{transcript_summary:summary.slice(0,4000)}});
-        if (!call.metadata?.human_takeover) await updateStatus(call,'completed');
+        if (!call.metadata?.human_takeover) {
+          const voicemail=event.data?.metadata?.features_usage?.voicemail_detection?.used===true;
+          await updateStatus(call,voicemail?'voicemail':'completed');
+        }
       } else if(event.type==='call_initiation_failure') {
         const reason=event.data?.failure_reason;
         if (!call.metadata?.human_takeover) await updateStatus(call,reason==='busy'?'busy':reason==='no-answer'?'no_answer':'failed');
@@ -174,20 +177,42 @@ app.get('/api/amei/confirm/list',wrap(async(req,res)=>{
   const statusId=Number(queryText(req.query.statusId));
   res.json(await amei(()=>ameiConfirmList({dateInit:queryText(req.query.dateInit)??'',dateFinish:queryText(req.query.dateFinish)??'',statusId:Number.isInteger(statusId)&&(statusId>0||statusId===-1)?statusId:undefined,specialtyId:queryText(req.query.specialtyId),professionalId:queryText(req.query.professionalId)})));
 }));
+app.get('/api/amei/confirm/recovery/:id',wrap(async(req,res)=>{res.json(await amei(()=>ameiRecoveryStatusOf(idParam(req))));}));
+app.post('/api/amei/captacao/search',wrap(async(req,res)=>{
+  const b=req.body as {mode?:string;specialtyId?:string;professionalId?:string;monthFrom?:string;monthTo?:string};
+  const jobId=await amei(()=>Promise.resolve(startCampaignSearch({mode:b.mode as CampaignMode,specialtyId:String(b.specialtyId??''),professionalId:b.professionalId,monthFrom:String(b.monthFrom??''),monthTo:String(b.monthTo??'')})));
+  res.status(201).json({jobId});
+}));
+app.get('/api/amei/captacao/search/:jobId',wrap(async(req,res)=>{res.json(await amei(()=>Promise.resolve(getCampaignSearch(req.params.jobId!))));}));
 app.post('/api/amei/confirm/call',wrap(async(req,res)=>{
   const {brainId,appointmentId}=req.body as {brainId?:string;appointmentId?:string};
   if(!brainId||!appointmentId)throw new PublicError(400,'Informe a consulta.');
   const call=await startConfirmationCall(brainId,String(appointmentId));res.status(201).json({success:true,call});
 }));
+app.post('/api/amei/confirm/auto/start',wrap(async(req,res)=>{
+  const b=req.body as {brainId?:string;dateInit?:string;dateFinish?:string;specialtyId?:string;professionalId?:string;startFromAppointmentId?:string;startFromDirection?:'up'|'down'};
+  if(!b.brainId||!b.dateInit||!b.dateFinish)throw new PublicError(400,'Informe cérebro e período.');
+  const startFrom=b.startFromAppointmentId&&(b.startFromDirection==='up'||b.startFromDirection==='down')?{appointmentId:b.startFromAppointmentId,direction:b.startFromDirection}:undefined;
+  startAutoConfirm(b.brainId,{dateInit:b.dateInit,dateFinish:b.dateFinish,specialtyId:b.specialtyId,professionalId:b.professionalId},startFrom);
+  res.status(201).json(autoConfirmStatus());
+}));
+app.post('/api/amei/confirm/auto/stop',wrap(async(_req,res)=>{stopAutoConfirm();res.json(autoConfirmStatus());}));
+app.get('/api/amei/confirm/auto/status',wrap(async(_req,res)=>{res.json(autoConfirmStatus());}));
 app.post('/api/amei/missed/call',wrap(async(req,res)=>{
   const {brainId,appointmentId}=req.body as {brainId?:string;appointmentId?:string};
   if(!brainId||!appointmentId)throw new PublicError(400,'Informe a consulta.');
   const call=await startMissedCall(brainId,String(appointmentId));res.status(201).json({success:true,call});
 }));
+app.post('/api/amei/captacao/call',wrap(async(req,res)=>{
+  const {brainId,waitlistId}=req.body as {brainId?:string;waitlistId?:string};
+  if(!brainId||!waitlistId)throw new PublicError(400,'Informe a entrada da lista de espera.');
+  const call=await startWaitlistCall(brainId,String(waitlistId));res.status(201).json({success:true,call});
+}));
 app.post('/api/amei/confirm/test',wrap(async(req,res)=>{
   const b=req.body as {kind?:string;situation?:string;brainId?:string;phone?:string;patientName?:string;professional?:string;specialty?:string;date?:string;time?:string;valor?:string};
   if(!b.brainId)throw new PublicError(400,'Selecione um cérebro.');
   if(b.kind==='missed'){const call=await startTestMissedCall(b.brainId,{phone:String(b.phone??''),patientName:String(b.patientName??''),professional:String(b.professional??''),specialty:String(b.specialty??''),date:String(b.date??''),time:String(b.time??''),situation:String(b.situation??'faltou')});res.status(201).json({success:true,call});return;}
+  if(b.kind==='waitlist'){const call=await startTestWaitlistCall(b.brainId,{phone:String(b.phone??''),patientName:String(b.patientName??''),specialty:String(b.specialty??''),professional:b.professional?String(b.professional):undefined});res.status(201).json({success:true,call});return;}
   const call=await startTestConfirmationCall(b.brainId,{phone:String(b.phone??''),patientName:String(b.patientName??''),professional:String(b.professional??''),specialty:String(b.specialty??''),date:String(b.date??''),time:String(b.time??''),valor:b.valor==null?undefined:String(b.valor)});
   res.status(201).json({success:true,call});
 }));
@@ -207,8 +232,17 @@ app.post('/api/calls',wrap(async(req,res)=>{
   const call=await startCall(brainId,patientName,phone,contactContext);res.status(201).json({success:true,call});
 }));
 app.get('/api/calls/:id',wrap(async(req,res)=>{res.json({call:await syncCall(requireCall(await getManagedCall(idParam(req))))});}));
+app.get('/api/calls/:id/transcript',wrap(async(req,res)=>{res.json(await getCallTranscript(requireCall(await getManagedCall(idParam(req)))));}));
+app.get('/api/calls/:id/audio',wrap(async(req,res)=>{
+  const {buffer,contentType}=await getCallAudio(requireCall(await getManagedCall(idParam(req))));
+  res.setHeader('Content-Type',contentType);
+  res.setHeader('Content-Length',String(buffer.length));
+  res.send(buffer);
+}));
 app.post('/api/calls/:id/end',wrap(async(req,res)=>{res.json({call:await endCall(requireCall(await getManagedCall(idParam(req))))});}));
 app.post('/api/calls/:id/takeover',wrap(async(req,res)=>{res.json({call:await takeoverCall(requireCall(await getManagedCall(idParam(req))))});}));
+app.post('/api/calls/:id/answered',wrap(async(req,res)=>{await markCallAnswered(requireCall(await getManagedCall(idParam(req))));res.json({success:true});}));
+app.post('/api/calls/:id/voicemail',wrap(async(req,res)=>{res.json({call:await markCallVoicemail(requireCall(await getManagedCall(idParam(req))))});}));
 app.patch('/api/calls/:id/result',wrap(async(req,res)=>{
   const {result,note}=req.body as {result?:CallResult;note?:string};
   if(typeof result!=='string' || (note!==undefined && typeof note!=='string'))throw new PublicError(400,'Resultado inválido.');

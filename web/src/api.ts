@@ -1,4 +1,4 @@
-import type { Brain, Call, ConnectionDetails, Contact, ImportReport, IntegrationStatus, MessageTemplate, Result, WhatsappMessage, WhatsappStatus, AmeiStatus, ConfirmOptions, ConfirmRow } from './types'
+import type { Brain, Call, CallTranscript, ConnectionDetails, Contact, ImportReport, IntegrationStatus, MessageTemplate, Result, WhatsappMessage, WhatsappStatus, AmeiStatus, ConfirmOptions, ConfirmRow, RecoveryInfo, CampaignMode, CampaignJobStatus, AutoConfirmStatus } from './types'
 
 export const apiBase = import.meta.env.VITE_API_BASE_URL || ''
 
@@ -32,7 +32,11 @@ export const api = {
   },
   endCall: (id: string) => request<unknown>(`/api/calls/${id}/end`, { method: 'POST' }),
   takeoverCall: async (id: string) => (await request<{ call: Call }>(`/api/calls/${id}/takeover`, { method: 'POST' })).call,
+  markCallAnswered: (id: string) => request<unknown>(`/api/calls/${id}/answered`, { method: 'POST' }),
+  markCallVoicemail: async (id: string) => (await request<{ call: Call }>(`/api/calls/${id}/voicemail`, { method: 'POST' })).call,
   saveResult: (id: string, result: Result, note: string) => request<unknown>(`/api/calls/${id}/result`, { method: 'PATCH', body: JSON.stringify({ result, note }) }),
+  callTranscript: (id: string) => request<CallTranscript>(`/api/calls/${id}/transcript`),
+  callAudioUrl: (id: string) => `${apiBase}/api/calls/${id}/audio`,
   integrations: () => request<IntegrationStatus>('/api/settings/status'),
   connections: () => request<ConnectionDetails>('/api/connections'),
   openCvortex: () => request<{ opening: boolean }>('/api/connections/cvortex/open', { method: 'POST' }),
@@ -57,8 +61,15 @@ export const api = {
     return request<{ rows: ConfirmRow[]; total: number }>(`/api/amei/confirm/list?${query}`)
   },
   confirmCall: async (brainId: string, appointmentId: string) => (await request<{ success: true; call: Call }>('/api/amei/confirm/call', { method: 'POST', body: JSON.stringify({ brainId, appointmentId }) })).call,
-  confirmTest: async (brainId: string, body: { kind?: 'confirm' | 'missed'; situation?: string; phone: string; patientName: string; professional: string; specialty: string; date: string; time: string; valor: string }) => (await request<{ success: true; call: Call }>('/api/amei/confirm/test', { method: 'POST', body: JSON.stringify({ brainId, ...body }) })).call,
+  startAutoConfirm: (filters: { brainId: string; dateInit: string; dateFinish: string; specialtyId?: string; professionalId?: string; startFromAppointmentId?: string; startFromDirection?: 'up' | 'down' }) => request<AutoConfirmStatus>('/api/amei/confirm/auto/start', { method: 'POST', body: JSON.stringify(filters) }),
+  stopAutoConfirm: () => request<AutoConfirmStatus>('/api/amei/confirm/auto/stop', { method: 'POST' }),
+  autoConfirmStatus: () => request<AutoConfirmStatus>('/api/amei/confirm/auto/status'),
+  confirmRecovery: (appointmentId: string) => request<RecoveryInfo>(`/api/amei/confirm/recovery/${appointmentId}`),
+  confirmTest: async (brainId: string, body: { kind?: 'confirm' | 'missed' | 'waitlist'; situation?: string; phone: string; patientName: string; professional?: string; specialty: string; date?: string; time?: string; valor?: string }) => (await request<{ success: true; call: Call }>('/api/amei/confirm/test', { method: 'POST', body: JSON.stringify({ brainId, ...body }) })).call,
   missedCall: async (brainId: string, appointmentId: string) => (await request<{ success: true; call: Call }>('/api/amei/missed/call', { method: 'POST', body: JSON.stringify({ brainId, appointmentId }) })).call,
+  waitlistCall: async (brainId: string, waitlistId: string) => (await request<{ success: true; call: Call }>('/api/amei/captacao/call', { method: 'POST', body: JSON.stringify({ brainId, waitlistId }) })).call,
+  startCampaignSearch: (filters: { mode: CampaignMode; specialtyId: string; professionalId?: string; monthFrom: string; monthTo: string }) => request<{ jobId: string }>('/api/amei/captacao/search', { method: 'POST', body: JSON.stringify(filters) }),
+  campaignSearchStatus: (jobId: string) => request<CampaignJobStatus>(`/api/amei/captacao/search/${jobId}`),
   ameiStatus: () => request<AmeiStatus>('/api/amei/status'),
   openAmei: () => request<{ opening: boolean }>('/api/amei/open', { method: 'POST' }),
   openWhatsapp: () => request<{ opening: boolean }>('/api/whatsapp/open', { method: 'POST' }),
