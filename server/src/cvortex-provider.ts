@@ -339,10 +339,13 @@ class CvortexBrowserProvider {
           session.missingCallControlTicks++;
           if (session.missingCallControlTicks >= 3) {
             console.info('[CVORTEX] controle ausente por 3 verificações; chamada encerrada', session.options.callId);
-            // Ninguém mexeu em nada (nem operador nem Giovana): se o paciente nunca disse uma palavra de
-            // verdade a ligação inteira, foi "não atendeu" de verdade (silêncio do início ao fim), não um
-            // "completed" normal — isso já dispara o WhatsApp de confirmação sozinho.
-            void this.finish(session, session.patientSaidSomething ? 'completed' : 'no_answer');
+            // Ninguém mexeu em nada (nem operador nem Giovana). Se o paciente falou de verdade em algum
+            // momento, foi uma conversa normal que simplesmente não foi encerrada via end_call. Se nunca
+            // falou, tem duas possibilidades: nunca chegou a conectar (silêncio = "não atendeu" de
+            // verdade) ou conectou (cronômetro do webphone confirmou) mas ficou tudo em silêncio do lado
+            // de lá — isso É caixa postal/URA muda, mesmo sem a Giovana ter reconhecido o padrão de voz.
+            // As duas últimas já disparam o WhatsApp de confirmação sozinhas.
+            void this.finish(session, session.patientSaidSomething ? 'completed' : session.patientConnected ? 'voicemail' : 'no_answer');
           }
         }
       }).catch(() => undefined);
@@ -653,8 +656,12 @@ class CvortexBrowserProvider {
       // Giovana encerra a ligação com a ferramenta end_call dela mesma: a ElevenLabs fecha esse socket
       // de forma normal (code 1000) quando isso acontece, antes de qualquer coisa dar errado. Sem
       // distinguir isso, toda ligação que terminou do jeito certo ficava marcada como "falhou".
+      // Se ela encerrou sem NUNCA ter ouvido uma palavra de verdade do paciente (ligação toda muda —
+      // caixa postal/URA que ela não chegou a reconhecer como tal, ou silêncio puro do início ao fim),
+      // isso é caixa postal de verdade, não uma conversa "completed" — e só assim o WhatsApp de
+      // confirmação dispara sozinho (ver updateStatusUnlocked em services.ts).
       if (code === 1000) {
-        void this.end(session.options.callId, 'completed').catch(error => {
+        void this.end(session.options.callId, session.patientSaidSomething ? 'completed' : 'voicemail').catch(error => {
           console.error('[CVORTEX] encerramento normal não confirmado:', error);
           void this.bridgeFailed(session, error instanceof Error ? error : new Error('Encerramento não confirmado.'));
         });
