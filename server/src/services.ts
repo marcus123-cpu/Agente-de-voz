@@ -112,7 +112,7 @@ export async function startCall(brainId: string, patientName: string, rawPhone: 
   try {
     await startCvortexCall({
       callId:call.id, phone, patientName:patientName.trim(), contactContext, agentId, whatsappModels, ameiAgenda: ameiAvailable, extraVariables: appointment ? appointmentVariables(appointment) : undefined,
-      promptOverride: effectiveAppointment ? promptFor(effectiveAppointment) : buildAcquisitionPrompt({ patientName: patientName.trim(), greeting: greetingForNow() }),
+      promptOverride: effectiveAppointment ? promptFor(effectiveAppointment) : buildAcquisitionPrompt({ patientName: patientName.trim(), greeting: greetingForNow(), campaign: contactContext === 'recent_card_member' ? 'new_card_member' : 'general' }),
       firstMessageOverride: effectiveAppointment ? firstMessageFor(effectiveAppointment) : acquisitionFirstMessage(greetingForNow(), patientName.trim()),
       onStatus:(status)=>{ void updateStatus(call,status).catch(error=>console.error('[CALL] status callback failed',error)); },
       onAgentConnected:()=>{ void getManagedCall(call.id).then(current=>current && !current.metadata?.human_takeover ? updateManagedCall(current,{metadata:{...(current.metadata||{}),ai_connected:true}}) : null).then(updated=>{if(updated)publish(updated);}).catch(error=>console.error('[CALL] agent callback failed',error)); },
