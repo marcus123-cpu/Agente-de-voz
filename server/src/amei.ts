@@ -110,7 +110,15 @@ class AmeiProvider {
   async get<T = unknown>(path: string): Promise<T> {
     await this.ensureFresh();
     this.inFlight += 1;
-    try { return await this.getNow<T>(path); }
+    try {
+      try { return await this.getNow<T>(path); }
+      catch (error) {
+        // A aba da AMEI recarrega sozinha de tempos em tempos; se isso cortar a leitura no meio, espera e tenta de novo uma vez.
+        if (!(error instanceof Error) || !/Execution context was destroyed|navigation/i.test(error.message)) throw error;
+        await new Promise(resolve => setTimeout(resolve, 2500));
+        return await this.getNow<T>(path);
+      }
+    }
     catch (error) {
       if (!(error instanceof AmeiAuthError)) throw error;
       this.inFlight -= 1; await this.refresh(true); this.inFlight += 1;   // sessão venceu: renova e tenta uma vez de novo
@@ -137,6 +145,28 @@ class AmeiProvider {
       throw new AmeiError('A AMEI não respondeu agora.');
     }
     return result.data as T;
+  }
+
+  /** GET que devolve também as respostas de erro (ex.: o Cartão de TODOS responde 400 com a mensagem quando não há matrícula). Só leitura. */
+  async getRaw(path: string): Promise<{ status: number; body: unknown }> {
+    await this.ensureFresh();
+    this.inFlight += 1;
+    try {
+      const page = await this.findPage(false);
+      if (!page || !page.url().startsWith(AMEI_ORIGIN)) throw new AmeiAuthError('A sessão da AMEI expirou. Entre de novo pela aba Automações.');
+      const result = await page.evaluate(async (url: string) => {
+        try {
+          const response = await fetch(url, { method: 'GET', credentials: 'same-origin', signal: AbortSignal.timeout(20000) });
+          if (response.status === 401 || response.status === 403) return { error: 'auth' as const };
+          const text = await response.text();
+          let body: unknown = null;
+          try { body = JSON.parse(text); } catch { /* sem JSON */ }
+          return { status: response.status, body };
+        } catch { return { error: 'network' as const }; }
+      }, path);
+      if ('error' in result) { if (result.error === 'auth') throw new AmeiAuthError('A sessão da AMEI expirou. Entre de novo pela aba Automações.'); throw new AmeiError('A AMEI não respondeu agora.'); }
+      return result;
+    } finally { this.inFlight -= 1; }
   }
 
   /** PUT na API da AMEI dentro da página logada (usado só pela confirmação de consultas). */
@@ -204,7 +234,7 @@ class AmeiProvider {
   }
 }
 
-export interface AmeiAdapter { status(): Promise<AmeiStatus>; open(): Promise<void>; get<T = unknown>(path: string): Promise<T>; put<T = unknown>(path: string, body: unknown): Promise<T>; post<T = unknown>(path: string, body: unknown): Promise<T> }
+export interface AmeiAdapter { status(): Promise<AmeiStatus>; open(): Promise<void>; getRaw?(path: string): Promise<{ status: number; body: unknown }>; get<T = unknown>(path: string): Promise<T>; put<T = unknown>(path: string, body: unknown): Promise<T>; post<T = unknown>(path: string, body: unknown): Promise<T> }
 let adapter: AmeiAdapter = new AmeiProvider();
 export function setAmeiForTests(value: AmeiAdapter): void { adapter = value; cache.clear(); }
 export const ameiStatus = (): Promise<AmeiStatus> => adapter.status();
@@ -315,7 +345,7 @@ export async function ameiFreeSlots(opts: { especialidade: string; profissional?
   const byDay = new Map<string, FreeSlot[]>();
   for (const slot of first) { const k = `${slot.date}|${slot.professional}`; byDay.set(k, [...(byDay.get(k) ?? []), slot]); }
   const lines = [...byDay.entries()].map(([k, slots]) => `- ${spoken(k.split('|')[0]!)} com ${slots[0]!.professional}: ${slots.map(s => s.time).join(', ')}`);
-  return `Horários livres de ${specialty.nome} (próximos disponíveis, não agende; ofereça no máximo 2 ou 3 e registre a escolha para a equipe confirmar):\n${lines.join('\n')}`;
+  return `Horários livres de ${specialty.nome} (próximos disponíveis; ofereça no máximo 2 ou 3. Lista não é reserva: o agendamento só acontece pela ferramenta agendar_consulta, quando o seu roteiro permitir, ou pelo Marcos):\n${lines.join('\n')}`;
 }
 
 /**
@@ -446,7 +476,7 @@ export async function ameiConfirmList(filters: ConfirmFilters): Promise<{ rows: 
 }
 
 // ─── Contexto de uma consulta (para a ligação de confirmação) ───────────────────────────────────
-export interface AppointmentContext { appointmentId: string; date: string; time: string; patientName: string; phone: string; professional: string; specialty: string; statusId: number; /** valor da consulta na AMEI, ex.: "102" */ valor?: string; /** ligação de teste: nada é gravado na AMEI */ test?: boolean; /** confirm = consulta a confirmar; missed = consulta perdida (faltoso); waitlist = paciente na lista de espera sem consulta futura */ kind?: 'confirm' | 'missed' | 'waitlist'; patientId?: string; specialtyId?: string; professionalId?: string; /** faltoso: já reagendou/foi atendido depois? (conferido na AMEI antes de ligar) */ recovery?: RecoveryInfo; /** lista de espera: id da entrada (não é um appointmentId de verdade) */ waitlistId?: string }
+export interface AppointmentContext { appointmentId: string; date: string; time: string; patientName: string; phone: string; professional: string; specialty: string; statusId: number; /** valor da consulta na AMEI, ex.: "102" */ valor?: string; /** ligação de teste: nada é gravado na AMEI */ test?: boolean; /** confirm = consulta a confirmar; missed = consulta perdida (faltoso); waitlist = paciente na lista de espera sem consulta futura */ kind?: 'confirm' | 'missed' | 'waitlist' | 'card'; /** Cartão de TODOS do paciente (checado pelo CPF na AMEI antes de ligar) */ cardStatus?: CardStatus; /** parceiro do agendamento (ex.: Particular) */ partner?: string; patientId?: string; specialtyId?: string; professionalId?: string; /** faltoso: já reagendou/foi atendido depois? (conferido na AMEI antes de ligar) */ recovery?: RecoveryInfo; /** lista de espera: id da entrada (não é um appointmentId de verdade) */ waitlistId?: string }
 const STATUS_AGENDADO = 2, STATUS_CONFIRMADO = 16, STATUS_DESMARCADO_PACIENTE = 9;
 const titleCase = (value: string): string => {
   let out = value.toLocaleLowerCase('pt-BR').replace(/(^|\s)(\p{L})/gu, (_m, space: string, letter: string) => space + letter.toLocaleUpperCase('pt-BR')).replace(/\s(Da|De|Do|Das|Dos|E)(?=\s)/g, m => m.toLowerCase())
@@ -468,9 +498,10 @@ const titleCase = (value: string): string => {
 
 interface AppointmentDetail {
   id: number | string; clinica: number | string; data: string; horaInicio: string; statusAgendamento: number; valorTotal?: number | string;
-  pacienteId?: { id?: number | string; nome?: string; sobrenome?: string; celular?: string };
+  pacienteId?: { id?: number | string; nome?: string; sobrenome?: string; celular?: string; cpf?: string };
   profissionalId?: { id?: number | string; nome?: string; sobrenome?: string };
   especialidadeId?: { id?: number | string; descricao?: string };
+  parceiroId?: { nome?: string };
 }
 async function appointmentDetail(appointmentId: string): Promise<AppointmentDetail> {
   if (!/^\d{1,12}$/.test(appointmentId)) throw new AmeiError('Consulta inválida.');
@@ -501,7 +532,7 @@ export async function ameiAppointmentContext(appointmentId: string): Promise<App
   let title = '';
   try { title = (await professionalTitles(detail.especialidadeId?.id)).get(String(detail.profissionalId?.id)) ?? ''; } catch { /* sem tratamento: fala só o nome */ }
   const professional = [title, titleCase([detail.profissionalId?.nome, detail.profissionalId?.sobrenome].filter(Boolean).join(' '))].filter(Boolean).join(' ').trim();
-  return { appointmentId, date, time, patientName: titleCase(patientName), phone, professional, specialty: String(detail.especialidadeId?.descricao ?? '').trim(), statusId: Number(detail.statusAgendamento), valor: detail.valorTotal != null && Number(detail.valorTotal) > 0 ? String(detail.valorTotal) : undefined };
+  return { appointmentId, date, time, patientName: titleCase(patientName), phone, professional, specialty: String(detail.especialidadeId?.descricao ?? '').trim(), statusId: Number(detail.statusAgendamento), cardStatus: await cardStatusOfCpf(detail.pacienteId?.cpf), valor: detail.valorTotal != null && Number(detail.valorTotal) > 0 ? String(detail.valorTotal) : undefined };
 }
 
 /** Fala natural para a Giovana: "quarta-feira, dia 11 de novembro" e "8 horas da manhã". */
@@ -531,8 +562,11 @@ const OUTCOMES: Record<ConfirmOutcome, { statusId: number; note: string; done: s
  * Muda o status da consulta desta ligação. Só altera se, NA HORA, a AMEI ainda mostrar a mesma consulta
  * (unidade, dia e hora) com status Agendado ou Confirmado; depois confere se a mudança pegou.
  */
-export async function ameiApplyOutcome(expected: { appointmentId: string; date: string; time: string }, outcome: ConfirmOutcome): Promise<string> {
-  const rule = OUTCOMES[outcome];
+export async function ameiApplyOutcome(expected: { appointmentId: string; date: string; time: string }, outcome: ConfirmOutcome, via: 'ligacao' | 'whatsapp' | 'manual' = 'ligacao'): Promise<string> {
+  const rule = outcome === 'confirmou' && via === 'whatsapp' ? { ...OUTCOMES.confirmou, note: 'Confirmado pelo WhatsApp pela assistente virtual Giovana (IA).' }
+    : outcome === 'confirmou' && via === 'manual' ? { ...OUTCOMES.confirmou, note: 'Confirmado manualmente pela equipe, pelo sistema de voz.' }
+    : outcome === 'desmarcou' && via === 'manual' ? { ...OUTCOMES.desmarcou, note: 'Cancelado pela equipe: consulta de teste da assistente virtual Giovana (IA).' }
+    : OUTCOMES[outcome];
   const detail = await appointmentDetail(expected.appointmentId);
   if (toIso(detail.data) !== expected.date || toHour(detail.horaInicio) !== expected.time) throw new AmeiError('A consulta mudou de dia ou horário na AMEI; não alterei nada.');
   const current = Number(detail.statusAgendamento);
@@ -614,7 +648,7 @@ export async function ameiMissedContext(appointmentId: string): Promise<Appointm
   const patientId = String(detail.pacienteId.id);
   const recovery = await ameiRecoveryStatus({ appointmentId, date, time, specialty, patientId });
   return {
-    appointmentId, date, time, patientName: titleCase(patientName), phone, professional, specialty, statusId,
+    appointmentId, date, time, patientName: titleCase(patientName), phone, professional, specialty, statusId, cardStatus: await cardStatusOfCpf(detail.pacienteId?.cpf),
     valor: detail.valorTotal != null && Number(detail.valorTotal) > 0 ? String(detail.valorTotal) : undefined,
     kind: 'missed', patientId, specialtyId: String(detail.especialidadeId.id), professionalId: detail.profissionalId?.id != null ? String(detail.profissionalId.id) : undefined, recovery,
   };
@@ -690,7 +724,12 @@ export async function ameiRecoveryStatus(original: { appointmentId: string; date
   try {
     const history = await recoveryHistory(original.patientId, original.date);
     if (!history.some(row => row.appointmentId === original.appointmentId)) throw new AmeiError('Consulta original ausente do histórico.');
-    const later = history.filter(row => row.appointmentId !== original.appointmentId && `${row.date} ${row.time}` > `${original.date} ${original.time}`);
+    // "Depois" = qualquer consulta posterior E também as do MESMO DIA da consulta perdida: se naquele dia ele foi
+    // atendido (mesmo numa consulta mais cedo, ou em outra especialidade), ele NÃO é faltoso de verdade. Consulta de
+    // mais cedo no mesmo dia só conta se foi atendida (agendada/confirmada de manhã que ficou velha não vale).
+    const originalWhen = `${original.date} ${original.time}`;
+    const later = history.filter(row => row.appointmentId !== original.appointmentId
+      && (`${row.date} ${row.time}` > originalWhen || (row.date === original.date && ATTENDED_IDS.has(row.statusId))));
     const now = nowBr();
     if (later.some(row => ATTENDED_IDS.has(row.statusId) && `${row.date} ${row.time}` > `${now.date} ${now.time}`)) throw new AmeiError('Consulta futura marcada como atendida; dado suspeito.');
     const same = later.filter(row => norm(row.specialty) === norm(original.specialty));
@@ -802,16 +841,44 @@ export async function ameiWaitlistContext(waitlistId: string): Promise<Appointme
 // ─── Captação: preencher agenda buscando faltosos sem reagendamento ou lista de espera esquecida ─
 // Busca ESTRITA: qualquer dúvida (erro, histórico incompleto, status desconhecido) exclui a linha
 // em vez de incluir. Zero falso positivo importa mais que achar todo mundo.
-export type CampaignMode = 'faltosos' | 'lista_espera';
+export type CampaignMode = 'faltosos' | 'lista_espera' | 'cartao';
 export interface CampaignRow {
   id: string; mode: CampaignMode; patientId: string; patientName: string; phone: string;
   specialty: string; specialtyId: string; professional?: string; professionalId?: string;
   originDate: string; situation?: MissedSituation; recoveryStatus: RecoveryStatus; availability?: AvailabilitySummary;
+  /** modo 'cartao': valor pago na consulta (particular) */ value?: string;
+  /** Cartão de TODOS (mesma checagem do Amei e do Gestão): ativo, devendo, sem cartão ou não conferido. */
+  cardStatus?: CardStatus;
 }
-export interface CampaignFilters { mode: CampaignMode; specialtyId: string; professionalId?: string; monthFrom: string; monthTo: string }
+export type CardStatus = 'ativo' | 'devendo' | 'sem_cartao' | 'nao_conferido';
+export type MissedSituations = 'faltou_desmarcou' | 'faltou' | 'desmarcou';
+export interface CampaignFilters {
+  mode: CampaignMode; specialtyId: string; professionalId?: string;
+  /** Período por mês (modo antigo)... */ monthFrom?: string; monthTo?: string;
+  /** ...ou por dia (AAAA-MM-DD): "faltou entre estes dias". Tem prioridade sobre os meses. */ dateFrom?: string; dateTo?: string;
+  /** Só faltosos: quais consultas perdidas entram (padrão antigo = faltou, desmarcou e cancelada). */ situations?: MissedSituations;
+  /** Só pacientes sem Cartão de TODOS. */ cardFilter?: 'todos' | 'sem_cartao';
+}
+
+/** Cartão de TODOS pelo CPF: 200 {ativo:true} = ativo; 400 "não existe" = sem cartão; "inadimplente/inativa" = devendo.
+ *  Falha de comunicação NUNCA vira "sem cartão" (vira não conferido). Lógica do painel Gestão Amor Saúde. */
+async function cardStatusOfCpf(cpfRaw: unknown): Promise<CardStatus> {
+  const cpf = digits(cpfRaw);
+  if (cpf.length !== 11 || !adapter.getRaw) return 'nao_conferido';
+  try {
+    const answer = await adapter.getRaw(`/api/v1/cartao-todos/matricula-ativa?matriculaoucpf=${encodeURIComponent(cpf)}`);
+    const body = (answer.body ?? {}) as { ativo?: unknown; mensagem?: unknown };
+    if (answer.status >= 200 && answer.status < 300 && body.ativo === true) return 'ativo';
+    const message = norm(body.mensagem);
+    if (message.includes('inadimplente') || message.includes('financeira inativa')) return 'devendo';
+    if (message.includes('nao existe')) return 'sem_cartao';
+    return 'nao_conferido';
+  } catch { return 'nao_conferido'; }
+}
 export interface CampaignJobStatus { jobId: string; status: 'running' | 'done' | 'error'; checked: number; total: number; found: number; results: CampaignRow[]; truncated: boolean; error?: string }
 
 const MONTH = /^\d{4}-\d{2}$/;
+const DAY = /^\d{4}-\d{2}-\d{2}$/;
 const campaignJobs = new Map<string, CampaignJobStatus>();
 const CAMPAIGN_MAX = 300;
 const CAMPAIGN_JOB_TTL_MS = 15 * 60_000;
@@ -832,13 +899,35 @@ function monthRangeDays(monthFrom: string, monthTo: string): { first: string; la
   return { first, last };
 }
 
+/** Primeiro e último dia da busca: por dia (dateFrom/dateTo) ou, no modo antigo, por mês. */
+function campaignPeriod(filters: CampaignFilters): { first: string; last: string } {
+  if (filters.dateFrom && filters.dateTo) return { first: filters.dateFrom, last: filters.dateTo };
+  return monthRangeDays(filters.monthFrom!, filters.monthTo!);
+}
+const SITUATION_STATUSES: Record<MissedSituations, number[]> = { faltou_desmarcou: [17, 9], faltou: [17], desmarcou: [9] };
+/** Um paciente aparece uma vez só: se a busca achar mais de uma consulta perdida dele, fica a mais recente. */
+function addCampaignResult(job: CampaignJobStatus, row: CampaignRow): void {
+  const key = row.patientId || row.phone;
+  const index = job.results.findIndex(existing => (existing.patientId || existing.phone) === key);
+  if (index >= 0) { if (row.originDate > job.results[index]!.originDate) job.results[index] = row; return; }
+  job.results.push(row);
+}
+
 export function startCampaignSearch(filters: CampaignFilters): string {
-  if (filters.mode !== 'faltosos' && filters.mode !== 'lista_espera') throw new AmeiError('Escolha o tipo de busca: faltosos ou lista de espera.');
+  if (filters.mode !== 'faltosos' && filters.mode !== 'lista_espera' && filters.mode !== 'cartao') throw new AmeiError('Escolha o tipo de busca: faltosos, lista de espera ou atendidos sem Cartão de TODOS.');
   if (!/^\d{1,10}$/.test(filters.specialtyId)) throw new AmeiError('Escolha uma especialidade válida.');
   if (filters.professionalId && !/^\d{1,10}$/.test(filters.professionalId)) throw new AmeiError('Profissional inválido.');
-  if (!MONTH.test(filters.monthFrom) || !MONTH.test(filters.monthTo)) throw new AmeiError('Informe o período em meses (ano-mês).');
-  if (filters.monthFrom > filters.monthTo) throw new AmeiError('O mês final não pode ser antes do mês inicial.');
-  if (monthsBetween(filters.monthFrom, filters.monthTo) > 24) throw new AmeiError('Escolha no máximo 24 meses por busca.');
+  if (filters.situations !== undefined && !['faltou_desmarcou', 'faltou', 'desmarcou'].includes(filters.situations)) throw new AmeiError('Situação inválida.');
+  if (filters.cardFilter !== undefined && !['todos', 'sem_cartao'].includes(filters.cardFilter)) throw new AmeiError('Filtro de cartão inválido.');
+  if (filters.dateFrom || filters.dateTo) {
+    if (!DAY.test(filters.dateFrom ?? '') || !DAY.test(filters.dateTo ?? '')) throw new AmeiError('Informe o período com dia inicial e dia final.');
+    if (filters.dateFrom! > filters.dateTo!) throw new AmeiError('O dia final não pode ser antes do dia inicial.');
+    if ((Date.parse(filters.dateTo!) - Date.parse(filters.dateFrom!)) / 86400000 > 366) throw new AmeiError('Escolha no máximo 1 ano por busca.');
+  } else {
+    if (!MONTH.test(filters.monthFrom ?? '') || !MONTH.test(filters.monthTo ?? '')) throw new AmeiError('Informe o período (dias ou meses).');
+    if (filters.monthFrom! > filters.monthTo!) throw new AmeiError('O mês final não pode ser antes do mês inicial.');
+    if (monthsBetween(filters.monthFrom!, filters.monthTo!) > 24) throw new AmeiError('Escolha no máximo 24 meses por busca.');
+  }
   const jobId = randomUUID();
   const job: CampaignJobStatus = { jobId, status: 'running', checked: 0, total: 0, found: 0, results: [], truncated: false };
   campaignJobs.set(jobId, job);
@@ -859,19 +948,20 @@ export function getCampaignSearch(jobId: string): CampaignJobStatus {
 
 async function runCampaignSearch(job: CampaignJobStatus, filters: CampaignFilters): Promise<void> {
   if (filters.mode === 'faltosos') await runFaltososCampaign(job, filters);
+  else if (filters.mode === 'cartao') await runCartaoCampaign(job, filters);
   else await runWaitlistCampaign(job, filters);
   job.status = 'done';
 }
 
 /** Candidatos a faltoso (id + quando) no período, sem o limite de 31 dias que a tela de Confirmar agenda tem. */
-async function faltosoCandidates(filters: CampaignFilters): Promise<Array<{ appointmentId: string; date: string; time: string }>> {
-  const { first, last } = monthRangeDays(filters.monthFrom, filters.monthTo);
+async function faltosoCandidates(filters: CampaignFilters, statusIds?: number[]): Promise<Array<{ appointmentId: string; date: string; time: string }>> {
+  const { first, last } = campaignPeriod(filters);
   const rows: Array<{ appointmentId: string; date: string; time: string }> = [];
   let total = 0;
   for (let page = 1; page <= 200; page++) {
     const qs = new URLSearchParams({ dateInit: first.replaceAll('-', ''), dateFinish: last.replaceAll('-', ''), unitId: CLINIC_ID, specialtyId: filters.specialtyId, page: String(page), limit: '100' });
     if (filters.professionalId) qs.set('professionalId', filters.professionalId);
-    for (const id of MISSED_STATUSES) qs.append('statusAppointmentId', String(id));
+    for (const id of (statusIds ?? (filters.situations ? SITUATION_STATUSES[filters.situations] : MISSED_STATUSES))) qs.append('statusAppointmentId', String(id));
     const data = await adapter.get<{ items?: Array<Record<string, unknown>>; meta?: { totalItems?: number } }>(`/api/v1/appointments/confirm/status?${qs}`);
     if (!Array.isArray(data.items) || !Number.isInteger(data.meta?.totalItems)) throw new AmeiError('A AMEI devolveu a lista de faltosos num formato inesperado.');
     total = data.meta!.totalItems!;
@@ -898,11 +988,13 @@ async function runFaltososCampaign(job: CampaignJobStatus, filters: CampaignFilt
       try {
         const context = await ameiMissedContext(candidate.appointmentId);
         if (context.recovery && NEEDS_RECOVERY.has(context.recovery.status) && context.patientId && context.specialtyId) {
+          const cardStatus = context.cardStatus ?? 'nao_conferido';
+          if (filters.cardFilter === 'sem_cartao' && cardStatus !== 'sem_cartao') { job.checked++; continue; }
           const availability = await ameiAvailabilityFor(context.specialtyId, context.professionalId).catch(() => undefined);
-          job.results.push({
+          addCampaignResult(job, {
             id: context.appointmentId, mode: 'faltosos', patientId: context.patientId, patientName: context.patientName, phone: context.phone,
             specialty: context.specialty, specialtyId: context.specialtyId, professional: context.professional || undefined, professionalId: context.professionalId,
-            originDate: context.date, situation: missedSituationOf(context.statusId), recoveryStatus: context.recovery.status, availability,
+            originDate: context.date, situation: missedSituationOf(context.statusId), recoveryStatus: context.recovery.status, availability, cardStatus,
           });
           job.found = job.results.length;
         }
@@ -913,9 +1005,61 @@ async function runFaltososCampaign(job: CampaignJobStatus, filters: CampaignFilt
   await Promise.all([worker(), worker(), worker()]);
 }
 
+// ─── Cartão de TODOS: atendidos como particular que ainda não têm o cartão ──────────────────────
+const CARD_ATTENDED = new Set([5, 60]); // Atendido e Atendido pós-consulta (mesmos status do painel Gestão)
+/** Lê a consulta já atendida e monta o contexto da ligação que oferece o Cartão de TODOS. Estrito: qualquer dúvida exclui. */
+export async function ameiCardContext(appointmentId: string): Promise<AppointmentContext> {
+  const detail = await appointmentDetail(appointmentId);
+  const date = toIso(detail.data), time = toHour(detail.horaInicio);
+  if (!date || !time) throw new AmeiError('A AMEI devolveu data ou hora inválidas.');
+  const statusId = Number(detail.statusAgendamento);
+  if (!CARD_ATTENDED.has(statusId)) throw new AmeiError('Essa consulta não está como atendida na AMEI; atualize a lista.');
+  const paid = Number(detail.valorTotal);
+  if (!Number.isFinite(paid) || paid <= 0) throw new AmeiError('A consulta está sem valor registrado; não dá para comparar com o Cartão de TODOS.');
+  const partner = String(detail.parceiroId?.nome ?? '').trim();
+  if (!norm(partner).includes('particular')) throw new AmeiError('Essa consulta não foi lançada como particular.');
+  const patientName = [detail.pacienteId?.nome, detail.pacienteId?.sobrenome].filter(Boolean).join(' ').trim();
+  const phone = digits(detail.pacienteId?.celular);
+  if (!patientName || phone.length < 10) throw new AmeiError('A consulta está sem nome ou celular do paciente.');
+  if (!detail.pacienteId?.id || !detail.especialidadeId?.id) throw new AmeiError('A consulta está sem paciente ou especialidade na AMEI.');
+  const cardStatus = await cardStatusOfCpf(detail.pacienteId.cpf);
+  if (cardStatus !== 'sem_cartao') throw new AmeiError(cardStatus === 'ativo' ? 'O paciente já tem o Cartão de TODOS ativo.' : cardStatus === 'devendo' ? 'O cartão do paciente está em atraso; não é caso de oferecer.' : 'Não consegui conferir o Cartão de TODOS; não liguei.');
+  let title = '';
+  try { title = (await professionalTitles(detail.especialidadeId.id)).get(String(detail.profissionalId?.id)) ?? ''; } catch { /* sem tratamento */ }
+  const professional = [title, titleCase([detail.profissionalId?.nome, detail.profissionalId?.sobrenome].filter(Boolean).join(' '))].filter(Boolean).join(' ').trim();
+  return {
+    appointmentId, date, time, patientName: titleCase(patientName), phone, professional, specialty: String(detail.especialidadeId.descricao ?? '').trim(), statusId,
+    valor: String(detail.valorTotal), kind: 'card', patientId: String(detail.pacienteId.id), specialtyId: String(detail.especialidadeId.id),
+    professionalId: detail.profissionalId?.id != null ? String(detail.profissionalId.id) : undefined, cardStatus, partner,
+  };
+}
+async function runCartaoCampaign(job: CampaignJobStatus, filters: CampaignFilters): Promise<void> {
+  let candidates = await faltosoCandidates(filters, [...CARD_ATTENDED]);
+  candidates.sort((a, b) => (b.date + b.time).localeCompare(a.date + a.time)); // mais recentes primeiro
+  if (candidates.length > CAMPAIGN_MAX) { candidates = candidates.slice(0, CAMPAIGN_MAX); job.truncated = true; }
+  job.total = candidates.length;
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < candidates.length) {
+      const candidate = candidates[cursor++]!;
+      try {
+        const context = await ameiCardContext(candidate.appointmentId);
+        addCampaignResult(job, {
+          id: context.appointmentId, mode: 'cartao', patientId: context.patientId!, patientName: context.patientName, phone: context.phone,
+          specialty: context.specialty, specialtyId: context.specialtyId!, professional: context.professional || undefined, professionalId: context.professionalId,
+          originDate: context.date, recoveryStatus: 'pendente', cardStatus: 'sem_cartao', value: context.valor,
+        });
+        job.found = job.results.length;
+      } catch { /* não é caso de oferecer o cartão (já tem, devendo, não particular ou não conferido): pula */ }
+      job.checked++;
+    }
+  };
+  await Promise.all([worker(), worker(), worker()]);
+}
+
 interface CampaignWaitlistItem {
   id: number; criadoEm?: string;
-  pacienteId?: { id?: number | string; nome?: string; sobrenome?: string; celular?: string };
+  pacienteId?: { id?: number | string; nome?: string; sobrenome?: string; celular?: string; cpf?: string };
   statusId?: { description?: string };
   especialidadeId?: { id?: number | string; descricao?: string };
   profissionalId?: { id?: number | string; tratamento?: string; nome?: string; sobrenome?: string } | null;
@@ -946,8 +1090,9 @@ async function runWaitlistCampaign(job: CampaignJobStatus, filters: CampaignFilt
   const items = await waitlistBySpecialty(filters.specialtyId);
   let candidates = items.filter(item => {
     if (norm(item.statusId?.description) !== 'pendente') return false;
-    const month = String(item.criadoEm ?? '').slice(0, 7);
-    if (!MONTH.test(month) || month < filters.monthFrom || month > filters.monthTo) return false;
+    const period = campaignPeriod(filters);
+    const day = String(item.criadoEm ?? '').slice(0, 10);
+    if (!DAY.test(day) || day < period.first || day > period.last) return false;
     if (filters.professionalId) { const pid = item.profissionalId?.id; if (pid != null && String(pid) !== filters.professionalId) return false; }
     if (item.agendamento != null) return false;
     if (!item.pacienteId?.id) return false;
@@ -968,10 +1113,12 @@ async function runWaitlistCampaign(job: CampaignJobStatus, filters: CampaignFilt
           const specialtyId = String(item.especialidadeId?.id ?? filters.specialtyId);
           const professionalId = item.profissionalId?.id != null ? String(item.profissionalId.id) : undefined;
           const professional = item.profissionalId ? [item.profissionalId.tratamento, titleCase([item.profissionalId.nome, item.profissionalId.sobrenome].filter(Boolean).join(' '))].filter(Boolean).join(' ').trim() : undefined;
+          const cardStatus = await cardStatusOfCpf(item.pacienteId!.cpf);
+          if (filters.cardFilter === 'sem_cartao' && cardStatus !== 'sem_cartao') { job.checked++; continue; }
           const availability = await ameiAvailabilityFor(specialtyId, professionalId).catch(() => undefined);
-          job.results.push({
+          addCampaignResult(job, {
             id: String(item.id), mode: 'lista_espera', patientId, patientName: titleCase([item.pacienteId!.nome, item.pacienteId!.sobrenome].filter(Boolean).join(' ')), phone: digits(item.pacienteId!.celular),
-            specialty, specialtyId, professional, professionalId, originDate: String(item.criadoEm).slice(0, 10), recoveryStatus: 'pendente', availability,
+            specialty, specialtyId, professional, professionalId, originDate: String(item.criadoEm).slice(0, 10), recoveryStatus: 'pendente', availability, cardStatus,
           });
           job.found = job.results.length;
         }
@@ -980,4 +1127,183 @@ async function runWaitlistCampaign(job: CampaignJobStatus, filters: CampaignFilt
     }
   };
   await Promise.all([worker(), worker(), worker()]);
+}
+
+// ─── Agendamento (escrita na AMEI): marcar uma consulta comum para um paciente já cadastrado ─────
+// Mesmo caminho da tela de agendamento da AMEI (payload montado como ela monta, conferido no código-fonte da AMEI e
+// no Bot AMEI): só consulta comum (sem encaixe, retorno, consulta assistida nem cadastro de paciente novo). Tudo é lido da
+// AMEI na hora (vaga, preço, local, parceiro) e conferido de novo antes de enviar. Só vale com a confirmação do operador.
+const CDT_PARTNER_ID = 41, PRIVATE_PARTNER_ID = 42, BOOKING_CHANNEL_ID = 3;
+export interface BookingRequest { cpf: string; specialtyId: string; professionalId: string; date: string; time: string }
+export interface BookingPlan {
+  patientId: string; patientName: string; specialtyId: string; specialty: string; professionalId: string; professional: string;
+  date: string; time: string; scheduleId: number; interval: number; partnerId: number; partner: string; cardStatus: CardStatus;
+  procedureId: string; procedure: string; localId: string; local: string; price: number; firstConsultation: number;
+}
+export interface BookingResult { appointmentId: string; plan: BookingPlan }
+
+/** Lê tudo da AMEI (só leitura) e monta o plano de agendamento. Qualquer dúvida vira erro: nunca chuta. */
+export async function ameiPrepareBooking(req: BookingRequest): Promise<BookingPlan> {
+  const cpf = digits(req.cpf);
+  if (cpf.length !== 11) throw new AmeiError('CPF inválido.');
+  if (!/^\d{1,10}$/.test(req.specialtyId) || !/^\d{1,10}$/.test(req.professionalId)) throw new AmeiError('Especialidade ou profissional inválidos.');
+  if (!DAY.test(req.date) || !toHour(req.time)) throw new AmeiError('Data ou horário inválidos.');
+  const now = nowBr();
+  if (`${req.date} ${req.time}` <= `${now.date} ${now.time}`) throw new AmeiError('Esse horário já passou.');
+  // 1) Paciente: precisa existir UM cadastro com esse CPF (não cria paciente).
+  const found = await adapter.get<{ data?: Array<{ id?: number | string; cpf?: string; nome?: string; sobrenome?: string; nomeCompleto?: string; obito?: boolean }> }>(`/api/v1/pacientes/all?cpf=${cpf}`);
+  const patients = (Array.isArray(found?.data) ? found.data : []).filter(p => digits(p.cpf) === cpf);
+  if (patients.length !== 1) throw new AmeiError('Não encontrei um cadastro único na AMEI para esse CPF. O paciente precisa estar cadastrado antes de agendar.');
+  const patient = patients[0]!;
+  if (patient.obito) throw new AmeiError('O cadastro do paciente consta como óbito.');
+  const patientId = String(patient.id ?? '');
+  if (!/^\d{1,12}$/.test(patientId)) throw new AmeiError('Cadastro do paciente sem identificador.');
+  rememberPatientCpf(patientId, cpf);
+  const patientName = String(patient.nomeCompleto ?? [patient.nome, patient.sobrenome].filter(Boolean).join(' ')).trim();
+  // 2) Vaga: relê a agenda do dia; o horário precisa estar Livre agora (e ser do profissional e da especialidade certos).
+  const compact = req.date.replaceAll('-', '');
+  const qs = new URLSearchParams({ idClinic: CLINIC_ID, idSpecialty: req.specialtyId, idProfessional: req.professionalId, initialDate: compact, finalDate: compact, initialHour: '00:00', endHour: '23:59', fetchPolicy: 'network-only', cancelledAppointments: 'false' });
+  const slots = await adapter.get<Array<{ professional?: { name?: string }; hours?: Array<Record<string, unknown>> }>>(`/api/v1/slots/list-slots-by-professional?${qs}`);
+  if (!Array.isArray(slots)) throw new AmeiError('A AMEI devolveu a agenda num formato inesperado.');
+  const matches: Array<{ hour: Record<string, unknown>; professionalName: string }> = [];
+  for (const entry of slots) for (const hour of entry.hours ?? []) {
+    if (norm(hour.status) !== 'livre' || toHour(hour.formatedHour) !== toHour(req.time) || toIso(hour.date) !== req.date) continue;
+    if (String(hour.idProfessional) !== req.professionalId || String(hour.specialtyId) !== req.specialtyId) continue;
+    if (hour.encaixe || hour.overbookingSchedule || hour.isAssistedScheduling) continue;
+    matches.push({ hour, professionalName: String(hour.professionalName ?? entry.professional?.name ?? '') });
+  }
+  if (matches.length !== 1) throw new AmeiError('Esse horário não está mais livre na AMEI (ou há mais de uma vaga igual). Escolha outro.');
+  const slot = matches[0]!.hour;
+  const scheduleId = Number(slot.idSchedule), interval = Number(slot.interval);
+  if (!Number.isInteger(scheduleId) || scheduleId <= 0 || !Number.isInteger(interval) || interval <= 0) throw new AmeiError('A vaga veio sem dados de agenda; não agendei.');
+  // 3) Cartão de TODOS decide o parceiro/tabela de preço, como a tela da AMEI: ativo = Cartão de TODOS; sem cartão = Particular.
+  const cardStatus = await cardStatusOfCpf(cpf);
+  // Só o cartão ATIVO usa a tabela do Cartão de TODOS; sem cartão ou em atraso cai no Particular (como a tela da AMEI). Não conferiu = não chuta.
+  if (cardStatus === 'nao_conferido') throw new AmeiError('Não consegui conferir o Cartão de TODOS; a equipe precisa agendar.');
+  const partnerId = cardStatus === 'ativo' ? CDT_PARTNER_ID : PRIVATE_PARTNER_ID;
+  const partner = cardStatus === 'ativo' ? 'Cartão de TODOS' : 'Particular';
+  // 4) Procedimento: exatamente UMA consulta (tipo 1) com preço e local, vinda da AMEI para esse parceiro.
+  const procedureQs = new URLSearchParams({
+    profissionalId: req.professionalId, especialidadeId: req.specialtyId, data: compact, horas: toHour(req.time)!,
+    dia: String(new Date(`${req.date}T12:00:00Z`).getUTCDay()), unidadeId: CLINIC_ID, parceiroId: String(partnerId), dataConsulta: now.date,
+    primeiraConsulta: '1', unidadePresencialId: CLINIC_ID, overbooking: 'false', scheduleId: String(scheduleId),
+  });
+  const rawProcedures = await adapter.get<Array<{ id?: number | string; descricao?: string; typeId?: number; price?: number | string; locais?: { id?: number | string; descricao?: string } }>>(`/api/v1/procedimentos/appointment?${procedureQs}`);
+  const consultas = (Array.isArray(rawProcedures) ? rawProcedures : []).filter(p => Number(p.typeId) === 1 && p.id != null && p.locais?.id != null && Number.isFinite(Number(p.price)) && Number(p.price) > 0);
+  if (consultas.length !== 1) throw new AmeiError('Não consegui identificar com segurança a consulta e o preço na AMEI; a equipe precisa agendar.');
+  const procedure = consultas[0]!;
+  // 5) Retorno: quem tem direito a retorno entra em outro fluxo (consulta de retorno) que a Giovana não faz.
+  let firstConsultation = 1;
+  try {
+    const check = await adapter.get<{ direitoRetorno?: boolean; primeiraConsulta?: number | boolean }>(`/api/v1/pacientes/${patientId}/check-retorno?${new URLSearchParams({ cpf, profissionalId: req.professionalId, especialidadeId: req.specialtyId, unidadeId: CLINIC_ID })}`);
+    if (check?.direitoRetorno) throw new AmeiError('O paciente tem direito a retorno nessa especialidade; a equipe precisa agendar o retorno.');
+    if (partnerId === PRIVATE_PARTNER_ID && check?.primeiraConsulta !== undefined) firstConsultation = Number(check.primeiraConsulta) ? 1 : 0;
+  } catch (error) { if (error instanceof AmeiError && /retorno/.test(error.message)) throw error; /* sem a checagem, mantém primeira consulta = 1 como a AMEI faz */ }
+  const specialtyName = (await specialties()).find(s => String(s.id) === req.specialtyId)?.nome ?? '';
+  return {
+    patientId, patientName, specialtyId: req.specialtyId, specialty: specialtyName, professionalId: req.professionalId, professional: matches[0]!.professionalName,
+    date: req.date, time: toHour(req.time)!, scheduleId, interval, partnerId, partner, cardStatus,
+    procedureId: String(procedure.id), procedure: String(procedure.descricao ?? ''), localId: String(procedure.locais!.id), local: String(procedure.locais!.descricao ?? ''), price: Number(procedure.price), firstConsultation,
+  };
+}
+
+/** Trava contra marcar duas vezes: uma tentativa com resposta duvidosa NÃO é repetida sozinha (confira na AMEI antes). */
+const bookingLedger = new Map<string, { status: 'sending' | 'done' | 'uncertain'; appointmentId?: string }>();
+const bookingFingerprint = (plan: BookingPlan): string => `${plan.patientId}|${plan.professionalId}|${plan.specialtyId}|${plan.date}|${plan.time}`;
+
+/** Marca a consulta (ESCRITA na AMEI). Só chamar depois que o operador aprovou o plano. Confere o resultado lendo a consulta criada. */
+export async function ameiBook(plan: BookingPlan, notes = 'Agendado pela assistente virtual Giovana (IA).'): Promise<BookingResult> {
+  const key = bookingFingerprint(plan);
+  const previous = bookingLedger.get(key);
+  if (previous) throw new AmeiError(previous.status === 'done' ? `Esse agendamento já foi feito (número ${previous.appointmentId}).` : 'Já houve uma tentativa para esse horário sem confirmação. Confira na AMEI antes de tentar de novo.');
+  // Revalida tudo logo antes de enviar: a vaga, o preço e o parceiro não podem ter mudado desde a revisão.
+  const fresh = await ameiPrepareBooking({ cpf: await patientCpfById(plan.patientId), specialtyId: plan.specialtyId, professionalId: plan.professionalId, date: plan.date, time: plan.time });
+  const same = fresh.patientId === plan.patientId && fresh.scheduleId === plan.scheduleId && fresh.partnerId === plan.partnerId && fresh.procedureId === plan.procedureId && fresh.localId === plan.localId && Math.abs(fresh.price - plan.price) < 0.005;
+  if (!same) throw new AmeiError('A vaga, o parceiro ou o preço mudaram na AMEI desde a revisão; não agendei. Faça de novo.');
+  bookingLedger.set(key, { status: 'sending' });
+  const payload = {
+    clinicaId: { id: Number(CLINIC_ID) }, pacienteId: { id: Number(plan.patientId) }, profissionalId: { id: Number(plan.professionalId) },
+    flgConsultaAssistida: 0, especialidadeId: { id: Number(plan.specialtyId) }, statusAgendamentoId: { id: STATUS_AGENDADO },
+    data: plan.date.replaceAll('-', ''), horaInicio: plan.time, interval: plan.interval, encaixe: false, retorno: false,
+    parceiroId: { id: plan.partnerId }, canalId: { id: BOOKING_CHANNEL_ID }, observacao: notes.slice(0, 250),
+    enviarSms: false, enviarEmail: false, valorTotal: String(plan.price), repeticaoPeriodicidade: 'Diaria',
+    agendamentosProcedimentos: [{ procedimentoId: { id: Number(plan.procedureId) }, valor: plan.price, localAtendimentoId: Number(plan.localId), parceiroId: plan.partnerId }],
+    primeiraConsulta: plan.firstConsultation, scheduleId: plan.scheduleId, overbooking: false, listaEsperaId: 0,
+  };
+  let response: { agendamentoId?: number | string; id?: number | string } | null;
+  try { response = await adapter.post<{ agendamentoId?: number | string; id?: number | string }>('/api/v1/appointments', payload); }
+  catch (error) {
+    // Recusa clara da AMEI = nada foi criado; erro de rede/resposta perdida = incerto (não repete).
+    if (error instanceof AmeiError && /recusou/.test(error.message)) { bookingLedger.delete(key); throw error; }
+    bookingLedger.set(key, { status: 'uncertain' }); throw error;
+  }
+  const appointmentId = String(response?.agendamentoId ?? response?.id ?? '');
+  if (!/^\d{1,12}$/.test(appointmentId)) { bookingLedger.set(key, { status: 'uncertain' }); throw new AmeiError('A AMEI não devolveu o número do agendamento. Confira na AMEI antes de tentar de novo.'); }
+  bookingLedger.set(key, { status: 'done', appointmentId });
+  for (const k of [...cache.keys()]) if (k.startsWith('appts:') || k.startsWith('slots:')) cache.delete(k);
+  // Confere lendo a consulta criada.
+  const detail = await appointmentDetail(appointmentId);
+  if (String(detail.pacienteId?.id) !== plan.patientId || toIso(detail.data) !== plan.date || toHour(detail.horaInicio) !== plan.time || String(detail.profissionalId?.id) !== plan.professionalId || Number(detail.statusAgendamento) !== STATUS_AGENDADO) {
+    throw new AmeiError(`A consulta ${appointmentId} foi criada, mas os dados lidos da AMEI não conferem; confira manualmente.`);
+  }
+  return { appointmentId, plan };
+}
+const patientCpfCache = new Map<string, string>();
+async function patientCpfById(patientId: string): Promise<string> {
+  const cached = patientCpfCache.get(patientId);
+  if (!cached) throw new AmeiError('Plano de agendamento expirado; faça a preparação de novo.');
+  return cached;
+}
+/** Guarda o CPF só na memória do servidor (nunca em disco) para a revalidação antes de enviar. */
+export function rememberPatientCpf(patientId: string, cpf: string): void { patientCpfCache.set(patientId, digits(cpf)); }
+
+/** Traduz o que a Giovana disse (especialidade, médico, DD/MM e hora) em IDs da AMEI. Qualquer ambiguidade vira erro: nunca chuta. */
+export async function ameiResolveBooking(input: { especialidade: string; profissional?: string; data: string; horario: string }): Promise<BookingRequest & { specialty: string }> {
+  const list = await specialties();
+  const specialty = matchSpecialty(list, input.especialidade);
+  if (!specialty) throw new AmeiError(`Não encontrei a especialidade "${input.especialidade}" na agenda.`);
+  const time = toHour(input.horario);
+  if (!time) throw new AmeiError('Horário inválido.');
+  // Data: DD/MM (ano deduzido: a próxima ocorrência) ou AAAA-MM-DD.
+  const today = nowBr();
+  let date: string | null = null;
+  const dm = /^(\d{1,2})\s*[\/-]\s*(\d{1,2})$/.exec(String(input.data).trim());
+  if (dm) {
+    const year = Number(today.date.slice(0, 4));
+    const candidate = (y: number) => `${y}-${dm[2]!.padStart(2, '0')}-${dm[1]!.padStart(2, '0')}`;
+    date = candidate(year) < today.date ? candidate(year + 1) : candidate(year);
+  } else date = toIso(input.data);
+  if (!date || Number.isNaN(Date.parse(date))) throw new AmeiError('Data inválida.');
+  if ((Date.parse(date) - Date.parse(today.date)) / 86400000 > 45) throw new AmeiError('Só agendo para os próximos 45 dias.');
+  // Profissional: pelo nome dito; sem nome, o único que tem esse horário livre.
+  let team = await professionals(specialty.id);
+  if (input.profissional?.trim()) {
+    const wanted = norm(input.profissional).replace(/^(dr|dra|doutor|doutora)\.?\s+/, '');
+    team = team.filter(p => norm(p.nome).includes(wanted) || wanted.includes(norm(p.nome).replace(/^(dr|dra)\.?\s+/, '')));
+    if (team.length !== 1) throw new AmeiError(team.length ? 'Mais de um profissional com esse nome; não consegui identificar.' : `Não encontrei "${input.profissional}" em ${specialty.nome}.`);
+    return { cpf: '', specialtyId: String(specialty.id), specialty: specialty.nome, professionalId: String(team[0]!.id), date, time };
+  }
+  const withSlot: Professional[] = [];
+  for (const professional of team.slice(0, 10)) {
+    const compact = date.replaceAll('-', '');
+    const qs = new URLSearchParams({ idClinic: CLINIC_ID, idSpecialty: String(specialty.id), idProfessional: String(professional.id), initialDate: compact, finalDate: compact, initialHour: '00:00', endHour: '23:59', fetchPolicy: 'network-only', cancelledAppointments: 'false' });
+    const slots = await adapter.get<Array<{ hours?: Array<Record<string, unknown>> }>>(`/api/v1/slots/list-slots-by-professional?${qs}`).catch(() => []);
+    if ((Array.isArray(slots) ? slots : []).some(entry => (entry.hours ?? []).some(h => norm(h.status) === 'livre' && toHour(h.formatedHour) === time))) withSlot.push(professional);
+  }
+  if (withSlot.length !== 1) throw new AmeiError(withSlot.length ? 'Mais de um profissional com esse horário livre; informe o nome do médico.' : 'Nenhum profissional tem esse horário livre.');
+  return { cpf: '', specialtyId: String(specialty.id), specialty: specialty.nome, professionalId: String(withSlot[0]!.id), date, time };
+}
+
+/** CPF do paciente da ligação, lido da AMEI na hora (nunca fica no contexto da ligação nem em disco). */
+export async function ameiCpfForContext(context: { appointmentId?: string; patientId?: string }): Promise<string> {
+  if (context.appointmentId && /^\d{1,12}$/.test(context.appointmentId)) {
+    const cpf = digits((await appointmentDetail(context.appointmentId)).pacienteId?.cpf);
+    if (cpf.length === 11) return cpf;
+  }
+  if (context.patientId && /^\d{1,12}$/.test(context.patientId)) {
+    const patient = await adapter.get<{ cpf?: string; id?: number | string }>(`/api/v1/pacientes/${context.patientId}`).catch(() => null);
+    const cpf = digits(patient?.cpf);
+    if (patient && String(patient.id) === context.patientId && cpf.length === 11) return cpf;
+  }
+  throw new AmeiError('Não consegui identificar o CPF do paciente na AMEI; a equipe precisa agendar.');
 }

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { ArrowDown, ArrowUp, PlayCircle, Phone, RefreshCw, Search, StopCircle } from 'lucide-react'
+import { ArrowDown, ArrowUp, CheckCircle2, PlayCircle, Phone, RefreshCw, Search, StopCircle } from 'lucide-react'
 import { api } from './api'
 import type { AutoConfirmStatus, Call, ConfirmOptions, ConfirmRow, RecoveryInfo } from './types'
 
@@ -40,6 +40,7 @@ export function ConfirmPanel({ brainId, canCall, onNotice, onStarted, onFailed, 
   const [professionalId, setProfessionalId] = useState(saved?.professionalId ?? '')
   const [patient, setPatient] = useState(saved?.patient ?? '')
   const [procedure, setProcedure] = useState(saved?.procedure ?? '')
+  const [onlyNotReturned, setOnlyNotReturned] = useState(false)
   const [rows, setRows] = useState<ConfirmRow[] | null>(saved?.rows ?? null)
   const [loading, setLoading] = useState(false)
   const [calling, setCalling] = useState<string | null>(null)
@@ -123,7 +124,12 @@ export function ConfirmPanel({ brainId, canCall, onNotice, onStarted, onFailed, 
   }
 
   const procedures = useMemo(() => [...new Set((rows ?? []).map((r) => r.procedure).filter(Boolean))].sort((a, b) => a.localeCompare(b, 'pt-BR')), [rows])
-  const visible = useMemo(() => (rows ?? []).filter((r) => (!patient.trim() || norm(`${r.patientName} ${r.patientSocial}`).includes(norm(patient.trim()))) && (!procedure || r.procedure === procedure)), [rows, patient, procedure])
+  const visible = useMemo(() => (rows ?? []).filter((r) => {
+    if (patient.trim() && !norm(`${r.patientName} ${r.patientSocial}`).includes(norm(patient.trim()))) return false
+    if (procedure && r.procedure !== procedure) return false
+    if (statusId === -1 && onlyNotReturned) { const info = recovery[r.appointmentId]; if (info && info !== 'loading' && RESOLVED_RECOVERY.has(info.status)) return false }
+    return true
+  }), [rows, patient, procedure, statusId, onlyNotReturned, recovery])
   const pages = Math.max(1, Math.ceil(visible.length / size))
   const shown = useMemo(() => visible.slice(page * size, page * size + size), [visible, page, size])
   const confirmed = (rows ?? []).filter((r) => r.statusId === 16).length
@@ -161,6 +167,14 @@ export function ConfirmPanel({ brainId, canCall, onNotice, onStarted, onFailed, 
     setCalling(row.appointmentId)
     try { onStarted(missed ? await api.missedCall(brainId, row.appointmentId) : await api.confirmCall(brainId, row.appointmentId)); onNotice(missed ? 'Ligando para recuperar a consulta...' : 'Ligando para confirmar a consulta...') }
     catch (cause) { const message = cause instanceof Error ? cause.message : 'Não foi possível iniciar a ligação.'; onFailed(row.patientName, message); fail(cause, message) }
+    finally { setCalling(null) }
+  }
+
+  async function confirmManual(row: ConfirmRow) {
+    if (!window.confirm(`Confirmar manualmente a consulta de ${row.patientName} em ${dmy(row.date)} às ${row.time}? A AMEI vai ficar como Confirmado.`)) return
+    setCalling(row.appointmentId)
+    try { onNotice(await api.confirmManual({ appointmentId: row.appointmentId, date: row.date, time: row.time })); await search(true) }
+    catch (cause) { fail(cause, 'Não foi possível confirmar na AMEI.') }
     finally { setCalling(null) }
   }
 
@@ -203,6 +217,7 @@ export function ConfirmPanel({ brainId, canCall, onNotice, onStarted, onFailed, 
       <label>Área de atuação<select value={specialtyId} onChange={(e) => setSpecialtyId(e.target.value)}><option value="">Todas</option>{options?.specialties.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}</select></label>
       <label>Profissional<select value={professionalId} disabled={!specialtyId} onChange={(e) => setProfessionalId(e.target.value)}><option value="">{specialtyId ? 'Todos' : 'Escolha a área'}</option>{professionals.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}</select></label>
       <label>Procedimentos<select value={procedure} disabled={!procedures.length} onChange={(e) => { setProcedure(e.target.value); setPage(0) }}><option value="">Todos</option>{procedures.map((p) => <option key={p} value={p}>{p}</option>)}</select></label>
+      {statusId === -1 && <label className="check-inline"><input type="checkbox" checked={onlyNotReturned} onChange={(e) => { setOnlyNotReturned(e.target.checked); setPage(0) }}/> Só quem realmente não retornou</label>}
       {statusId === -1 && <p className="muted confirm-hint">Faltosos: junta <b>não compareceu</b>, <b>desmarcado pelo paciente</b> e <b>cancelado</b>, só de consultas que já passaram. A coluna Reagendou? confere na AMEI se o paciente já resolveu isso antes de ligar. Clique no telefone para a Giovana ligar, entender o que houve e oferecer nova consulta ou lista de espera.</p>}
       <button className="primary-button" disabled={loading || !dateInit || !dateFinish} onClick={() => void search()}><Search size={15}/> {loading ? 'Pesquisando...' : 'Pesquisar'}</button>
       {rows !== null && <button className="ghost-button" disabled={loading} onClick={() => void search()}><RefreshCw size={15}/> Atualizar</button>}
@@ -233,6 +248,7 @@ export function ConfirmPanel({ brainId, canCall, onNotice, onStarted, onFailed, 
         <td>{r.note || '—'}</td>
         <td className="row-actions">
           <button className="icon-call" title={auto?.active ? 'A esteira está ligando sozinha; pare pra escolher manualmente' : r.statusId === 2 ? 'Ligar para confirmar' : MISSED_STATUS.has(r.statusId) ? 'Ligar para recuperar a consulta (nova consulta ou lista de espera)' : 'Só consultas Agendadas ou perdidas podem ser ligadas'} disabled={!canCall || calling !== null || Boolean(auto?.active) || (r.statusId !== 2 && !MISSED_STATUS.has(r.statusId)) || r.phone.length < 10} onClick={() => void call(r)}><Phone size={15}/></button>
+          {r.statusId === 2 && <button className="icon-call" title="Confirmar manualmente (sem ligar): muda para Confirmado na AMEI" disabled={calling === r.appointmentId} onClick={() => void confirmManual(r)}><CheckCircle2 size={15}/></button>}
           {statusId === 2 && !auto?.active && r.statusId === 2 && <>
             <button className="icon-call" title="Ligar esteira a partir deste paciente, pra baixo na lista" disabled={autoBusy || !canCall || !dateInit || !dateFinish} onClick={() => void toggleAuto({ appointmentId: r.appointmentId, direction: 'down' })}><ArrowDown size={15}/></button>
             <button className="icon-call" title="Ligar esteira a partir deste paciente, pra cima na lista" disabled={autoBusy || !canCall || !dateInit || !dateFinish} onClick={() => void toggleAuto({ appointmentId: r.appointmentId, direction: 'up' })}><ArrowUp size={15}/></button>

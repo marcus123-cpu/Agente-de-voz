@@ -3,6 +3,7 @@ import { fileURLToPath } from 'node:url';
 import { chromium, type Browser, type Page } from 'playwright';
 
 const CDP_URL = process.env.WHATSAPP_CDP_URL || 'http://127.0.0.1:9224';
+const norm = (value: string): string => value.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
 const WA_ORIGIN = 'https://web.whatsapp.com';
 
 export interface WhatsappStatus { browserOpen: boolean; loggedIn: boolean; qrVisible: boolean; busy: boolean }
@@ -65,6 +66,37 @@ class WhatsappProvider {
     return run;
   }
 
+  /** Lê o que o contato respondeu DEPOIS da nossa mensagem (a que contém `anchor`). Um acesso por vez, na mesma fila dos envios. */
+  readReplies(phone: string, anchor: string): Promise<string[]> {
+    this.pending += 1;
+    const run = this.chain.then(() => this.readNow(phone, anchor));
+    this.chain = run.catch(() => undefined).finally(() => { this.pending -= 1; });
+    return run;
+  }
+
+  private async readNow(phone: string, anchor: string): Promise<string[]> {
+    const digits = phone.replace(/\D/g, '');
+    if (!/^\d{10,15}$/.test(digits)) return [];
+    let page: Page;
+    try { page = await this.getPage(); } catch { return []; }
+    await page.goto(`${WA_ORIGIN}/send?phone=${digits}`, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    const composer = page.locator('footer div[contenteditable="true"]').first();
+    const ok = await composer.waitFor({ state: 'visible', timeout: 30000 }).then(() => true).catch(() => false);
+    if (!ok) return [];
+    await page.waitForTimeout(1500);
+    return page.evaluate((needle: string) => {
+      const norm = (value: string) => value.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
+      const nodes = Array.from(document.querySelectorAll('div.message-in, div.message-out')) as HTMLElement[];
+      let anchorIndex = -1;
+      nodes.forEach((node, index) => { if (node.classList.contains('message-out') && norm(node.innerText).includes(needle)) anchorIndex = index; });
+      if (anchorIndex < 0) return [];
+      return nodes.slice(anchorIndex + 1).filter(node => node.classList.contains('message-in')).map(node => {
+        const spans = Array.from(node.querySelectorAll('span.selectable-text')) as HTMLElement[];
+        return (spans.length ? spans.map(span => span.innerText).join(' ') : node.innerText).replace(/\s+/g, ' ').trim();
+      }).filter(Boolean);
+    }, norm(anchor));
+  }
+
   private async sendNow(phone: string, text: string): Promise<void> {
     const digits = phone.replace(/\D/g, '');
     if (!/^\d{10,15}$/.test(digits)) throw new WhatsappSendError('Número inválido.');
@@ -90,9 +122,10 @@ class WhatsappProvider {
   }
 }
 
-export interface WhatsappAdapter { status(): Promise<WhatsappStatus>; open(): Promise<void>; send(phone: string, text: string): Promise<void> }
+export interface WhatsappAdapter { status(): Promise<WhatsappStatus>; open(): Promise<void>; send(phone: string, text: string): Promise<void>; readReplies?(phone: string, anchor: string): Promise<string[]> }
 let adapter: WhatsappAdapter = new WhatsappProvider();
 export function setWhatsappForTests(value: WhatsappAdapter): void { adapter = value; }
 export const whatsappStatus = (): Promise<WhatsappStatus> => adapter.status();
 export const openWhatsapp = (): Promise<void> => adapter.open();
+export const readWhatsappReplies = (phone: string, anchor: string): Promise<string[]> => adapter.readReplies?.(phone, anchor) ?? Promise.resolve([]);
 export const sendWhatsapp = (phone: string, text: string): Promise<void> => adapter.send(phone, text);

@@ -10,9 +10,9 @@ import * as repo from './repository.js';
 import { CallEventsService } from './monitor.js';
 import { cvortexConnectionStatus, cvortexReady, openCvortexBrowser } from './cvortex-provider.js';
 import { openWhatsapp, whatsappStatus } from './whatsapp.js';
-import { ameiStatus, openAmei, ameiConfirmList, ameiConfirmOptions, ameiProfessionalsOf, ameiRecoveryStatusOf, startCampaignSearch, getCampaignSearch, type CampaignMode, AmeiError } from './amei.js';
+import { ameiStatus, ameiApplyOutcome, openAmei, ameiConfirmList, ameiConfirmOptions, ameiProfessionalsOf, ameiRecoveryStatusOf, startCampaignSearch, getCampaignSearch, type CampaignMode, type MissedSituations, AmeiError } from './amei.js';
 import { connectElevenLabs, connectionDetails, disconnectElevenLabs } from './connections.js';
-import { PublicError, startConfirmationCall, startTestConfirmationCall, startMissedCall, startWaitlistCall, startTestMissedCall, startTestWaitlistCall, startAutoConfirm, stopAutoConfirm, autoConfirmStatus, normalizePhone, sendTestWhatsapp, endCall, getCallAudio, getCallTranscript, getManagedCall, getManagedCallByConversationId, listManagedCalls, markCallAnswered, markCallVoicemail, saveResult, startCall, syncCall, takeoverCall, updateStatus } from './services.js';
+import { PublicError, startWhatsappReplyWatcher, startConfirmationCall, startTestConfirmationCall, startMissedCall, startWaitlistCall, startCardCall, startTestMissedCall, startTestWaitlistCall, startAutoConfirm, startCaptacaoAuto, decideBooking, stopCaptacaoAuto, captacaoAutoStatus, stopAutoConfirm, autoConfirmStatus, normalizePhone, sendTestWhatsapp, endCall, getCallAudio, getCallTranscript, getManagedCall, getManagedCallByConversationId, listManagedCalls, markCallAnswered, markCallVoicemail, saveResult, startCall, syncCall, takeoverCall, updateStatus } from './services.js';
 import type { CallResult, ContactSource } from './types.js';
 
 const app=express();
@@ -179,8 +179,8 @@ app.get('/api/amei/confirm/list',wrap(async(req,res)=>{
 }));
 app.get('/api/amei/confirm/recovery/:id',wrap(async(req,res)=>{res.json(await amei(()=>ameiRecoveryStatusOf(idParam(req))));}));
 app.post('/api/amei/captacao/search',wrap(async(req,res)=>{
-  const b=req.body as {mode?:string;specialtyId?:string;professionalId?:string;monthFrom?:string;monthTo?:string};
-  const jobId=await amei(()=>Promise.resolve(startCampaignSearch({mode:b.mode as CampaignMode,specialtyId:String(b.specialtyId??''),professionalId:b.professionalId,monthFrom:String(b.monthFrom??''),monthTo:String(b.monthTo??'')})));
+  const b=req.body as {mode?:string;specialtyId?:string;professionalId?:string;monthFrom?:string;monthTo?:string;dateFrom?:string;dateTo?:string;situations?:string;cardFilter?:string};
+  const jobId=await amei(()=>Promise.resolve(startCampaignSearch({mode:b.mode as CampaignMode,specialtyId:String(b.specialtyId??''),professionalId:b.professionalId,monthFrom:b.monthFrom||undefined,monthTo:b.monthTo||undefined,dateFrom:b.dateFrom||undefined,dateTo:b.dateTo||undefined,situations:(b.situations||undefined) as MissedSituations|undefined,cardFilter:(b.cardFilter||undefined) as 'todos'|'sem_cartao'|undefined})));
   res.status(201).json({jobId});
 }));
 app.get('/api/amei/captacao/search/:jobId',wrap(async(req,res)=>{res.json(await amei(()=>Promise.resolve(getCampaignSearch(req.params.jobId!))));}));
@@ -189,6 +189,12 @@ app.post('/api/amei/confirm/call',wrap(async(req,res)=>{
   if(!brainId||!appointmentId)throw new PublicError(400,'Informe a consulta.');
   const call=await startConfirmationCall(brainId,String(appointmentId));res.status(201).json({success:true,call});
 }));
+app.post('/api/amei/confirm/manual',wrap(async(req,res)=>{
+  const {appointmentId,date,time}=req.body as {appointmentId?:unknown;date?:unknown;time?:unknown};
+  if(typeof appointmentId!=='string'||!/^\d{1,12}$/.test(appointmentId)||typeof date!=='string'||!/^\d{4}-\d{2}-\d{2}$/.test(date)||typeof time!=='string'||!/^\d{2}:\d{2}$/.test(time))throw new PublicError(400,'Consulta inválida.');
+  try{res.json({success:true,message:await ameiApplyOutcome({appointmentId,date,time},'confirmou','manual')});}
+  catch(error){if(error instanceof AmeiError)throw new PublicError(409,error.message);throw error;}
+}));
 app.post('/api/amei/confirm/auto/start',wrap(async(req,res)=>{
   const b=req.body as {brainId?:string;dateInit?:string;dateFinish?:string;specialtyId?:string;professionalId?:string;startFromAppointmentId?:string;startFromDirection?:'up'|'down'};
   if(!b.brainId||!b.dateInit||!b.dateFinish)throw new PublicError(400,'Informe cérebro e período.');
@@ -196,12 +202,26 @@ app.post('/api/amei/confirm/auto/start',wrap(async(req,res)=>{
   startAutoConfirm(b.brainId,{dateInit:b.dateInit,dateFinish:b.dateFinish,specialtyId:b.specialtyId,professionalId:b.professionalId},startFrom);
   res.status(201).json(autoConfirmStatus());
 }));
+app.post('/api/amei/captacao/auto/start',wrap(async(req,res)=>{
+  const b=req.body as {brainId?:string;jobId?:string;startFromId?:string;startFromDirection?:'up'|'down'};
+  if(!b.brainId||!b.jobId)throw new PublicError(400,'Informe cérebro e busca.');
+  const startFrom=b.startFromId&&(b.startFromDirection==='up'||b.startFromDirection==='down')?{id:b.startFromId,direction:b.startFromDirection}:undefined;
+  startCaptacaoAuto(b.brainId,b.jobId,startFrom);
+  res.status(201).json(captacaoAutoStatus());
+}));
+app.post('/api/amei/captacao/auto/stop',wrap(async(_req,res)=>{stopCaptacaoAuto();res.json(captacaoAutoStatus());}));
+app.get('/api/amei/captacao/auto/status',wrap(async(_req,res)=>{res.json(captacaoAutoStatus());}));
 app.post('/api/amei/confirm/auto/stop',wrap(async(_req,res)=>{stopAutoConfirm();res.json(autoConfirmStatus());}));
 app.get('/api/amei/confirm/auto/status',wrap(async(_req,res)=>{res.json(autoConfirmStatus());}));
 app.post('/api/amei/missed/call',wrap(async(req,res)=>{
   const {brainId,appointmentId}=req.body as {brainId?:string;appointmentId?:string};
   if(!brainId||!appointmentId)throw new PublicError(400,'Informe a consulta.');
   const call=await startMissedCall(brainId,String(appointmentId));res.status(201).json({success:true,call});
+}));
+app.post('/api/amei/captacao/cartao/call',wrap(async(req,res)=>{
+  const {brainId,appointmentId}=req.body as {brainId?:string;appointmentId?:string};
+  if(!brainId||!appointmentId)throw new PublicError(400,'Informe a consulta.');
+  const call=await startCardCall(brainId,String(appointmentId));res.status(201).json({success:true,call});
 }));
 app.post('/api/amei/captacao/call',wrap(async(req,res)=>{
   const {brainId,waitlistId}=req.body as {brainId?:string;waitlistId?:string};
@@ -242,6 +262,12 @@ app.get('/api/calls/:id/audio',wrap(async(req,res)=>{
 app.post('/api/calls/:id/end',wrap(async(req,res)=>{res.json({call:await endCall(requireCall(await getManagedCall(idParam(req))))});}));
 app.post('/api/calls/:id/takeover',wrap(async(req,res)=>{res.json({call:await takeoverCall(requireCall(await getManagedCall(idParam(req))))});}));
 app.post('/api/calls/:id/answered',wrap(async(req,res)=>{await markCallAnswered(requireCall(await getManagedCall(idParam(req))));res.json({success:true});}));
+app.post('/api/calls/:id/booking',wrap(async(req,res)=>{
+  const {decision}=req.body as {decision?:string};
+  if(decision!=='approve'&&decision!=='reject')throw new PublicError(400,'Decisão inválida.');
+  requireCall(await getManagedCall(idParam(req)));
+  decideBooking(idParam(req),decision);res.json({success:true});
+}));
 app.post('/api/calls/:id/voicemail',wrap(async(req,res)=>{res.json({call:await markCallVoicemail(requireCall(await getManagedCall(idParam(req))))});}));
 app.patch('/api/calls/:id/result',wrap(async(req,res)=>{
   const {result,note}=req.body as {result?:CallResult;note?:string};
@@ -259,4 +285,4 @@ app.use((error:unknown,_req:Request,res:Response,_next:NextFunction)=>{
 const server=createServer(app);
 const events=new CallEventsService();
 server.on('upgrade',(req,socket,head)=>{events.upgrade(req,socket,head).catch(error=>{console.error('[WS]',error);socket.destroy();});});
-server.listen(config.port,()=>console.info(`[API] listening on ${config.port}`));
+server.listen(config.port,()=>{console.info(`[API] listening on ${config.port}`);startWhatsappReplyWatcher();});

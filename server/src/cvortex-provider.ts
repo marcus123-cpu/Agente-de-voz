@@ -29,7 +29,7 @@ export interface CvortexStartOptions {
   callId: string;
   phone: string;
   patientName: string;
-  contactContext: 'not_informed' | 'recent_card_member' | 'appointment_confirmation' | 'missed_appointment' | 'waitlist_capture';
+  contactContext: 'not_informed' | 'recent_card_member' | 'appointment_confirmation' | 'missed_appointment' | 'waitlist_capture' | 'card_pitch';
   agentId: string;
   /** Modelos de WhatsApp que a IA pode enviar (vira a variável {{modelos_whatsapp}} do prompt). */
   whatsappModels?: string;
@@ -112,6 +112,13 @@ function patientAudioReady(session: Session): boolean {
 }
 /** Manda um chunk de áudio do paciente pra Giovana (ou guarda, se ela ainda não está pronta pra ouvir). */
 function sendPatientAudio(session: Session, chunk: Buffer): void {
+  // Enquanto o paciente ainda não atendeu (toque, caixa postal anunciando), o áudio vai SÓ pra escuta ao vivo
+  // do operador: a Giovana não recebe nada disso (nem guardado pra depois). O buffer só começa quando o
+  // cronômetro do webphone confirma o atendimento, pra não perder o "alô" enquanto ela conecta.
+  if (!session.patientConnected && !session.agentSocket) {
+    try { session.options.onAudio?.('patient', chunk); } catch { /* escuta nunca derruba a ligação */ }
+    return;
+  }
   // Sempre tenta esvaziar o que ficou pendente ANTES deste chunk, pra manter a ordem e pra um pico de
   // backpressure no meio da ligação (ex.: bufferedAmount passou de MAX_BUFFERED por um instante) não deixar
   // a fala do paciente ("sim", "tá ligado?") perdida pra sempre — sem isso ela só era esvaziada no começo
@@ -162,6 +169,7 @@ class CvortexBrowserProvider {
   private page: Page | null = null;
   private instrumented = false;
   private active: Session | null = null;
+  private lastFinishedAt = 0;
   private browserLaunchRequested = false;
   private lastBrowserLaunchAttempt = 0;
 
@@ -284,6 +292,10 @@ class CvortexBrowserProvider {
     if (this.active && !this.active.ended) throw new Error('O webphone já possui uma chamada controlada por este processo.');
     if (!options.callId || !options.agentId || !options.patientName.trim()) throw new Error('Dados da chamada incompletos.');
     const digits = phoneDigits(options.phone);
+    // Dá tempo do webphone terminar de desmontar a ligação anterior antes de recarregar a página (ligações seguidas da
+    // esteira recarregavam rápido demais e o cVortex clicava no lugar errado).
+    const settle = this.lastFinishedAt + 5_000 - Date.now();
+    if (settle > 0) await new Promise(resolve => setTimeout(resolve, settle));
     const page = await this.getPage();
     if (await page.locator('svg[aria-label="Call End"]').count()) throw new Error('Há uma chamada ativa no webphone.');
     await this.instrument(page);
@@ -414,6 +426,7 @@ class CvortexBrowserProvider {
       const receiver = pc.getReceivers().find(value => value.track?.kind === 'audio')!;
       const microphone = sender.track!;
       const microphoneWasEnabled = microphone.enabled;
+      microphone.enabled = false;
       const context = new AudioContext({ sampleRate: 16000 });
       await context.resume();
       const source = context.createMediaStreamSource(new MediaStream([receiver.track]));
@@ -431,7 +444,11 @@ class CvortexBrowserProvider {
       // Silencia o áudio local do webphone (o painel já toca a conversa) para não duplicar no fone.
       // A ponte lê a trilha WebRTC direto, então o mute dos elementos não afeta a captura.
       const touched = new Set<HTMLMediaElement>();
-      const muteLocal = () => { document.querySelectorAll('audio,video').forEach(el => { const media = el as HTMLMediaElement; if (!media.muted) { media.muted = true; touched.add(media); } }); };
+      // Ligação feita pelo painel: UMA saída de som só (a do painel, "Ouvir", que já traz tudo desde o toque) e o
+      // microfone do operador mudo até ele clicar em Assumir (restore() devolve o microfone). Ligações normais
+      // recebidas no cVortex não passam por aqui, então o microfone delas funciona normalmente.
+      let muting = true;
+      const muteLocal = () => { if (!muting) return; document.querySelectorAll('audio,video').forEach(el => { const media = el as HTMLMediaElement; if (!media.muted) { media.muted = true; touched.add(media); } }); };
       muteLocal();
       const muteTimer = setInterval(muteLocal, 500);
       const unmuteLocal = () => { clearInterval(muteTimer); touched.forEach(media => { try { media.muted = false; } catch { /* removido */ } }); touched.clear(); };
@@ -461,7 +478,7 @@ class CvortexBrowserProvider {
         if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'start' }));
       };
       processor.onaudioprocess = event => {
-        if (!authenticated || !sending || socket.readyState !== WebSocket.OPEN || socket.bufferedAmount > 512000) return;
+        if (!authenticated || socket.readyState !== WebSocket.OPEN || socket.bufferedAmount > 512000) return;
         const samples = event.inputBuffer.getChannelData(0);
         const inputRate = context.sampleRate;
         const length = Math.max(1, Math.floor(samples.length * 16000 / inputRate));
@@ -604,7 +621,7 @@ class CvortexBrowserProvider {
         const reply = (result: string, isError: boolean) => { if (agent.readyState === WebSocket.OPEN) agent.send(JSON.stringify({ type: 'client_tool_result', tool_call_id: call.tool_call_id, result, is_error: isError })); };
         const handle = session.options.onToolCall;
         if (!handle) reply('Ferramenta indisponível.', true);
-        else void Promise.race([handle(String(call.tool_name ?? ''), call.parameters ?? {}), new Promise<string>((_, reject) => setTimeout(() => reject(new Error('timeout')), /^(consultar|registrar)_/.test(String(call.tool_name ?? '')) ? 15000 : 4000))])
+        else void Promise.race([handle(String(call.tool_name ?? ''), call.parameters ?? {}), new Promise<string>((_, reject) => setTimeout(() => reject(new Error('timeout')), String(call.tool_name ?? '') === 'agendar_consulta' ? 88000 : /^(consultar|registrar)_/.test(String(call.tool_name ?? '')) ? 15000 : 4000))])
           .then(result => reply(result, false)).catch(() => reply('Não foi possível salvar agora; siga a conversa normalmente.', true));
       }
       if (message.type === 'interruption') {
@@ -758,6 +775,7 @@ class CvortexBrowserProvider {
 
   private async finish(session: Session, status: CallStatus): Promise<void> {
     if (session.ended) return;
+    this.lastFinishedAt = Date.now();
     session.ended = true;
     session.ending = true;
     if (session.monitor) clearInterval(session.monitor);

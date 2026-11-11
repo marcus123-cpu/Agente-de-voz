@@ -18,12 +18,15 @@ export interface AvailabilitySummary { count: number; next: Array<{ date: string
 export interface RecoveryInfo { status: RecoveryStatus; label: string; next?: { date: string; time: string; specialty: string }; availability?: AvailabilitySummary }
 export interface ConfirmOptions { specialties: { id: string; name: string }[]; statuses: { id: number; name: string }[] }
 export interface AutoConfirmStatus { active: boolean; current: string | null; currentCallId: string | null; remaining: number; calledCount: number; lastError: string | null; startedAt: string | null }
-export type CampaignMode = 'faltosos' | 'lista_espera'
+export type CampaignMode = 'faltosos' | 'lista_espera' | 'cartao'
 export interface CampaignRow {
   id: string; mode: CampaignMode; patientId: string; patientName: string; phone: string;
   specialty: string; specialtyId: string; professional?: string; professionalId?: string;
   originDate: string; situation?: 'faltou' | 'desmarcou' | 'cancelada';
   recoveryStatus: RecoveryStatus; availability?: AvailabilitySummary;
+  cardStatus?: 'ativo' | 'devendo' | 'sem_cartao' | 'nao_conferido';
+  /** modo 'cartao': valor pago como particular */
+  value?: string;
 }
 export interface CampaignJobStatus { jobId: string; status: 'running' | 'done' | 'error'; checked: number; total: number; found: number; results: CampaignRow[]; truncated: boolean; error?: string }
 export interface AmeiStatus { browserOpen: boolean; loggedIn: boolean; user?: string }

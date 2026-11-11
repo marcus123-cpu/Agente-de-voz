@@ -1,10 +1,23 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Phone, Search } from 'lucide-react'
+import { ArrowDown, ArrowUp, PlayCircle, Phone, Search, StopCircle } from 'lucide-react'
 import { api } from './api'
-import type { Call, CampaignJobStatus, CampaignMode, CampaignRow, ConfirmOptions, RecoveryInfo } from './types'
+import type { AutoConfirmStatus, Call, CampaignJobStatus, CampaignMode, CampaignRow, ConfirmOptions, RecoveryInfo } from './types'
 
-function thisMonth() { return new Date().toISOString().slice(0, 7) }
-function todayIso() { return new Date().toISOString().slice(0, 10) }
+function todayIso() { return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Sao_Paulo' }).format(new Date()) }
+function addDays(iso: string, days: number) { const d = new Date(`${iso}T12:00:00Z`); d.setUTCDate(d.getUTCDate() + days); return d.toISOString().slice(0, 10) }
+/** Atalhos de período: hoje, ontem, 7 dias, semana passada (seg a dom) e este mês. */
+function presetRange(kind: 'hoje' | 'ontem' | '7dias' | 'semana' | 'mes'): { from: string; to: string } {
+  const today = todayIso()
+  if (kind === 'hoje') return { from: today, to: today }
+  if (kind === 'ontem') { const y = addDays(today, -1); return { from: y, to: y } }
+  if (kind === '7dias') return { from: addDays(today, -6), to: today }
+  if (kind === 'semana') { const dow = new Date(`${today}T12:00:00Z`).getUTCDay(); const monday = addDays(today, -((dow + 6) % 7) - 7); return { from: monday, to: addDays(monday, 6) } }
+  return { from: `${today.slice(0, 7)}-01`, to: today }
+}
+const CARD_TAGS: Record<NonNullable<CampaignRow['cardStatus']>, { label: string; className: string }> = {
+  ativo: { label: 'Cartão ativo', className: 'tag tag-ok' }, devendo: { label: 'Cartão em atraso', className: 'tag tag-block' },
+  sem_cartao: { label: 'Sem Cartão de TODOS', className: 'tag tag-block' }, nao_conferido: { label: 'Não conferido', className: 'tag' },
+}
 function dmy(iso: string) { const [y, m, d] = iso.split('-'); return `${d}/${m}/${y}` }
 function formatPhone(value: string) {
   const d = value.replace(/\D/g, '').replace(/^55(?=\d{10,11}$)/, '')
@@ -28,8 +41,10 @@ export function CaptacaoPanel({ brainId, canCall, onNotice, onStarted, onFailed 
   const [specialtyId, setSpecialtyId] = useState('')
   const [professionalId, setProfessionalId] = useState('')
   const [mode, setMode] = useState<CampaignMode>('faltosos')
-  const [monthFrom, setMonthFrom] = useState(thisMonth())
-  const [monthTo, setMonthTo] = useState(thisMonth())
+  const [dateFrom, setDateFrom] = useState(presetRange('ontem').from)
+  const [dateTo, setDateTo] = useState(presetRange('ontem').to)
+  const [situations, setSituations] = useState<'faltou_desmarcou' | 'faltou' | 'desmarcou'>('faltou_desmarcou')
+  const [cardFilter, setCardFilter] = useState<'todos' | 'sem_cartao'>('todos')
   const [job, setJob] = useState<CampaignJobStatus | null>(null)
   const [searching, setSearching] = useState(false)
   const [calling, setCalling] = useState<string | null>(null)
@@ -37,6 +52,11 @@ export function CaptacaoPanel({ brainId, canCall, onNotice, onStarted, onFailed 
   const [test, setTest] = useState({ phone: '', patientName: 'Maria da Silva Souza', professional: 'Dra. Ana Souza Exemplo', specialty: 'Psiquiatria', date: todayIso(), time: '08:00', situation: 'faltou' })
   const [testing, setTesting] = useState(false)
   const firstSpecialty = useRef(true)
+  const [auto, setAuto] = useState<AutoConfirmStatus | null>(null)
+  const [autoBusy, setAutoBusy] = useState(false)
+  const lastAutoCallId = useRef<string | null>(null)
+  const onStartedRef = useRef(onStarted)
+  onStartedRef.current = onStarted
   const fail = useCallback((cause: unknown, fallback: string) => onNotice(cause instanceof Error ? cause.message : fallback), [onNotice])
 
   useEffect(() => { void api.confirmOptions().then(setOptions).catch((c) => fail(c, 'Não foi possível carregar os filtros da AMEI.')) }, [fail])
@@ -56,11 +76,42 @@ export function CaptacaoPanel({ brainId, canCall, onNotice, onStarted, onFailed 
     return () => { alive = false; window.clearInterval(timer) }
   }, [job, fail])
 
+  // Esteira: confere o status sempre e, quando ela inicia uma ligação sozinha, empurra a ligação pro painel (ouvir ao vivo e widget).
+  useEffect(() => {
+    let alive = true
+    const poll = () => {
+      void api.captacaoAutoStatus().then((value) => {
+        if (!alive) return
+        setAuto(value)
+        if (value.currentCallId && value.currentCallId !== lastAutoCallId.current) {
+          lastAutoCallId.current = value.currentCallId
+          void api.call(value.currentCallId).then((current) => { if (alive) onStartedRef.current(current) }).catch(() => undefined)
+        }
+      }).catch(() => undefined)
+    }
+    poll()
+    const timer = window.setInterval(poll, 3000)
+    return () => { alive = false; window.clearInterval(timer) }
+  }, [])
+
+  async function toggleAuto(startFrom?: { id: string; direction: 'up' | 'down' }) {
+    setAutoBusy(true)
+    try {
+      if (auto?.active) { setAuto(await api.stopCaptacaoAuto()); onNotice('Esteira desligada.') }
+      else {
+        if (!job) { onNotice('Faça a busca primeiro.'); return }
+        setAuto(await api.startCaptacaoAuto({ brainId, jobId: job.jobId, startFromId: startFrom?.id, startFromDirection: startFrom?.direction }))
+        onNotice(startFrom ? `Esteira ligada a partir desse paciente, pra ${startFrom.direction === 'down' ? 'baixo' : 'cima'}.` : 'Esteira ligada: chamando um paciente atrás do outro.')
+      }
+    } catch (cause) { fail(cause, 'Não foi possível mudar a esteira.') }
+    finally { setAutoBusy(false) }
+  }
+
   async function search() {
     if (!specialtyId) { onNotice('Escolha a especialidade.'); return }
     setSearching(true)
     try {
-      const { jobId } = await api.startCampaignSearch({ mode, specialtyId, professionalId: professionalId || undefined, monthFrom, monthTo })
+      const { jobId } = await api.startCampaignSearch({ mode, specialtyId, professionalId: professionalId || undefined, dateFrom, dateTo, situations: mode === 'faltosos' ? situations : undefined, cardFilter })
       setJob({ jobId, status: 'running', checked: 0, total: 0, found: 0, results: [], truncated: false })
     } catch (cause) { fail(cause, 'Não foi possível iniciar a busca na AMEI.') }
     finally { setSearching(false) }
@@ -68,12 +119,12 @@ export function CaptacaoPanel({ brainId, canCall, onNotice, onStarted, onFailed 
 
   async function call(row: CampaignRow) {
     const detail = availabilityDetail(row)
-    const when = row.mode === 'faltosos' ? `faltou em ${dmy(row.originDate)}` : `na lista de espera desde ${dmy(row.originDate)}`
+    const when = row.mode === 'faltosos' ? `faltou em ${dmy(row.originDate)}` : row.mode === 'cartao' ? `foi atendido em ${dmy(row.originDate)} pelo particular${row.value ? ` (pagou R$ ${row.value})` : ''}, sem Cartão de TODOS` : `na lista de espera desde ${dmy(row.originDate)}`
     const question = `Ligar agora para ${row.patientName} (${formatPhone(row.phone)}) — ${row.specialty}, ${when}?${detail ? ` ${detail}.` : ''}`
     if (!window.confirm(question)) return
     setCalling(row.id)
     try {
-      const call = row.mode === 'faltosos' ? await api.missedCall(brainId, row.id) : await api.waitlistCall(brainId, row.id)
+      const call = row.mode === 'faltosos' ? await api.missedCall(brainId, row.id) : row.mode === 'cartao' ? await api.cardCall(brainId, row.id) : await api.waitlistCall(brainId, row.id)
       onStarted(call); onNotice('Ligando...')
     } catch (cause) { const message = cause instanceof Error ? cause.message : 'Não foi possível iniciar a ligação.'; onFailed(row.patientName, message); fail(cause, message) }
     finally { setCalling(null) }
@@ -119,12 +170,24 @@ export function CaptacaoPanel({ brainId, canCall, onNotice, onStarted, onFailed 
     <section className="confirm-filters">
       <label>Área de atuação *<select value={specialtyId} onChange={(e) => setSpecialtyId(e.target.value)}><option value="">Escolha</option>{options?.specialties.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}</select></label>
       <label>Profissional<select value={professionalId} disabled={!specialtyId} onChange={(e) => setProfessionalId(e.target.value)}><option value="">{specialtyId ? 'Todos' : 'Escolha a área'}</option>{professionals.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}</select></label>
-      <label>O que puxar *<select value={mode} onChange={(e) => setMode(e.target.value as CampaignMode)}><option value="faltosos">Faltosos sem reagendamento</option><option value="lista_espera">Lista de espera sem consulta futura</option></select></label>
-      <label>De (mês) *<input type="month" value={monthFrom} onChange={(e) => { setMonthFrom(e.target.value); if (e.target.value > monthTo) setMonthTo(e.target.value) }}/></label>
-      <label>Até (mês) *<input type="month" value={monthTo} min={monthFrom} onChange={(e) => setMonthTo(e.target.value)}/></label>
-      <p className="muted confirm-hint">{mode === 'faltosos' ? 'Consultas perdidas (não compareceu, desmarcou ou cancelou) nesses meses, cujo paciente nunca conseguiu remarcar depois.' : 'Pacientes com entrada "pendente" na lista de espera dessa especialidade, criada nesses meses, sem nenhuma consulta futura marcada para ela.'} Se não der pra confirmar com certeza, o paciente fica de fora — a busca é rígida de propósito.</p>
+      <label>O que puxar *<select value={mode} onChange={(e) => setMode(e.target.value as CampaignMode)}><option value="faltosos">Faltosos sem reagendamento</option><option value="lista_espera">Lista de espera sem consulta futura</option><option value="cartao">Atendidos pelo particular sem Cartão de TODOS</option></select></label>
+      <label>{mode === 'faltosos' ? 'Faltou de *' : mode === 'cartao' ? 'Atendido de *' : 'Entrou na lista de *'}<input type="date" value={dateFrom} onChange={(e) => { setDateFrom(e.target.value); if (e.target.value > dateTo) setDateTo(e.target.value) }}/></label>
+      <label>Até *<input type="date" value={dateTo} min={dateFrom} onChange={(e) => setDateTo(e.target.value)}/></label>
+      <div className="preset-row">{([['hoje', 'Hoje'], ['ontem', 'Ontem'], ['7dias', 'Últimos 7 dias'], ['semana', 'Semana passada'], ['mes', 'Este mês']] as const).map(([kind, label]) => <button key={kind} type="button" className="ghost-button" onClick={() => { const r = presetRange(kind); setDateFrom(r.from); setDateTo(r.to) }}>{label}</button>)}</div>
+      {mode === 'faltosos' && <label>Situação<select value={situations} onChange={(e) => setSituations(e.target.value as typeof situations)}><option value="faltou_desmarcou">Faltou ou desmarcou (paciente)</option><option value="faltou">Só quem faltou</option><option value="desmarcou">Só desmarcado pelo paciente</option></select></label>}
+      {mode !== 'cartao' && <label>Cartão de TODOS<select value={cardFilter} onChange={(e) => setCardFilter(e.target.value as typeof cardFilter)}><option value="todos">Todos</option><option value="sem_cartao">Só quem NÃO tem o cartão</option></select></label>}
+      <p className="muted confirm-hint">{mode === 'faltosos' ? 'Consultas perdidas (não compareceu, desmarcou ou cancelou) nesses dias, cujo paciente nunca conseguiu remarcar depois.' : 'Pacientes com entrada "pendente" na lista de espera dessa especialidade, criada nesses dias, sem nenhuma consulta futura marcada para ela.'} Se não der pra confirmar com certeza, o paciente fica de fora — a busca é rígida de propósito.</p>
       <button className="primary-button" disabled={searching || running || !specialtyId} onClick={() => void search()}><Search size={15}/> {running ? 'Buscando...' : searching ? 'Iniciando...' : 'Buscar'}</button>
     </section>
+
+    {job && (job.results.length > 0 || auto?.active) && <section className="confirm-summary auto-confirm">
+      <button className={auto?.active ? 'monitor-button monitor-button-active' : 'monitor-button'} disabled={autoBusy || running || (!auto?.active && !canCall)} onClick={() => void toggleAuto()}>
+        {auto?.active ? <StopCircle size={15}/> : <PlayCircle size={15}/>} {auto?.active ? 'Parar esteira' : 'Ligar automaticamente (esteira)'}
+      </button>
+      {auto?.active && <span className="tag tag-ok">Ligando sozinha{auto.current ? '...' : ''} · {auto.calledCount} ligada{auto.calledCount === 1 ? '' : 's'}{auto.remaining ? ` · ${auto.remaining} na fila` : ''}</span>}
+      {auto?.lastError && <small className="muted">Último aviso: {auto.lastError}</small>}
+      {!auto?.active && <small className="muted">Liga um paciente atrás do outro, na ordem da lista de baixo, até acabar. Para escolher por onde começar, use as setas ↓ (daquele pra baixo) e ↑ (daquele pra cima) na linha do paciente.</small>}
+    </section>}
 
     {job && <div className="confirm-summary">
       <span className="tag">{job.found} encontrado{job.found === 1 ? '' : 's'}</span>
@@ -133,17 +196,23 @@ export function CaptacaoPanel({ brainId, canCall, onNotice, onStarted, onFailed 
       {job.truncated && <small className="muted">Mostrando só os 300 mais relevantes — reduza o período pra ver tudo.</small>}
     </div>}
 
-    <div className="table-wrap"><table><thead><tr><th>Paciente</th><th>Contato</th><th>Especialidade</th><th>Profissional</th><th>{mode === 'faltosos' ? 'Faltou em' : 'Na lista desde'}</th><th>Disponibilidade</th><th/></tr></thead><tbody>
-      {!job && <tr><td colSpan={7} className="table-empty">Escolha os filtros e clique em Buscar.</td></tr>}
-      {job && job.results.length === 0 && <tr><td colSpan={7} className="table-empty">{running ? 'Conferindo na AMEI...' : 'Nenhum paciente encontrado nesse período e filtro.'}</td></tr>}
+    <div className="table-wrap"><table><thead><tr><th>Paciente</th><th>Contato</th><th>Especialidade</th><th>Profissional</th><th>{mode === 'faltosos' ? 'Faltou em' : mode === 'cartao' ? 'Atendido em' : 'Na lista desde'}</th><th>Cartão de TODOS</th><th>Disponibilidade</th><th/></tr></thead><tbody>
+      {!job && <tr><td colSpan={8} className="table-empty">Escolha os filtros e clique em Buscar.</td></tr>}
+      {job && job.results.length === 0 && <tr><td colSpan={8} className="table-empty">{running ? 'Conferindo na AMEI...' : 'Nenhum paciente encontrado nesse período e filtro.'}</td></tr>}
       {job?.results.map((r) => <tr key={r.id}>
         <td><strong>{r.patientName}</strong></td>
         <td>{formatPhone(r.phone)}</td>
         <td>{r.specialty}</td>
         <td>{r.professional || '—'}</td>
         <td>{dmy(r.originDate)}{r.situation && <small className="row-note">{r.situation === 'faltou' ? 'Não compareceu' : r.situation === 'desmarcou' ? 'Desmarcado' : 'Cancelada'}</small>}</td>
-        <td><span className={recoveryTagClass(r.recoveryStatus)}>{availabilityDetail(r) || 'Sem vaga no momento'}</span></td>
-        <td className="row-actions"><button className="icon-call" title="Ligar para oferecer uma nova consulta" disabled={!canCall || calling !== null || r.phone.length < 10} onClick={() => void call(r)}><Phone size={15}/></button></td>
+        <td>{r.cardStatus ? <span className={CARD_TAGS[r.cardStatus].className}>{CARD_TAGS[r.cardStatus].label}</span> : '—'}</td>
+        <td>{r.mode === 'cartao' ? <span className="tag">Pagou R$ {r.value ?? '—'} (particular)</span> : <span className={recoveryTagClass(r.recoveryStatus)}>{availabilityDetail(r) || 'Sem vaga no momento'}</span>}</td>
+        <td className="row-actions"><button className="icon-call" title={r.mode === 'cartao' ? 'Ligar para apresentar o Cartão de TODOS' : 'Ligar para oferecer uma nova consulta'} disabled={!canCall || calling !== null || auto?.active === true || r.phone.length < 10} onClick={() => void call(r)}><Phone size={15}/></button>
+          {!auto?.active && !running && <>
+            <button className="icon-call" title="Ligar esteira a partir deste paciente, pra baixo na lista" disabled={autoBusy || !canCall || r.phone.length < 10} onClick={() => void toggleAuto({ id: r.id, direction: 'down' })}><ArrowDown size={15}/></button>
+            <button className="icon-call" title="Ligar esteira a partir deste paciente, pra cima na lista" disabled={autoBusy || !canCall || r.phone.length < 10} onClick={() => void toggleAuto({ id: r.id, direction: 'up' })}><ArrowUp size={15}/></button>
+          </>}
+        </td>
       </tr>)}
     </tbody></table></div>
     {!canCall && <p className="muted">Para ligar, o cVortex e o ElevenLabs precisam estar disponíveis e nenhuma outra ligação pode estar em andamento.</p>}

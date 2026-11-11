@@ -2,10 +2,10 @@ import { parsePhoneNumberFromString } from 'libphonenumber-js';
 import { config } from './config.js';
 import * as repo from './repository.js';
 import { cvortexReady, startCvortexCall, endCvortexCall, takeoverCvortexCall, markCvortexCallAnswered, greetingForNow } from './cvortex-provider.js';
-import { buildConfirmationPrompt, confirmationFirstMessage, buildMissedPrompt, missedFirstMessage, buildWaitlistPrompt, waitlistFirstMessage, buildAcquisitionPrompt, acquisitionFirstMessage } from './confirm-prompt.js';
+import { buildConfirmationPrompt, confirmationFirstMessage, buildMissedPrompt, missedFirstMessage, buildWaitlistPrompt, waitlistFirstMessage, buildAcquisitionPrompt, acquisitionFirstMessage, buildCardPitchPrompt, cardPitchFirstMessage, cardReferencePrice } from './confirm-prompt.js';
 import { publishLive } from './live.js';
-import { sendWhatsapp, whatsappStatus, WhatsappSendError } from './whatsapp.js';
-import { ameiStatus, ameiFreeSlots, ameiPatientAppointments, ameiAppointmentContext, ameiApplyOutcome, ameiMissedContext, ameiWaitlistContext, ameiAddToWaitlist, ameiConfirmList, missedSituationOf, startAmeiWarming, spokenLongDay, spokenClock, spokenMoney, AmeiError, type AppointmentContext, type ConfirmFilters } from './amei.js';
+import { sendWhatsapp, whatsappStatus, readWhatsappReplies, WhatsappSendError } from './whatsapp.js';
+import { getCampaignSearch, ameiCardContext, ameiResolveBooking, ameiCpfForContext, ameiPrepareBooking, ameiBook, type BookingPlan, ameiStatus, ameiFreeSlots, ameiPatientAppointments, ameiAppointmentContext, ameiApplyOutcome, ameiMissedContext, ameiWaitlistContext, ameiAddToWaitlist, ameiConfirmList, missedSituationOf, startAmeiWarming, spokenLongDay, spokenClock, spokenMoney, AmeiError, type AppointmentContext, type ConfirmFilters } from './amei.js';
 import type { Call, CallResult, CallStatus } from './types.js';
 import { SELF_TALK_PATTERNS } from './self-talk-patterns.js';
 
@@ -78,9 +78,9 @@ export function normalizePhone(value: string): string {
   if (!phone?.isValid() || phone.country !== 'BR') throw new PublicError(400,'Número inválido. Informe um celular brasileiro com DDD.');
   return phone.number;
 }
-export async function startCall(brainId: string, patientName: string, rawPhone: string, contactContext: 'not_informed' | 'recent_card_member' | 'appointment_confirmation' | 'missed_appointment' | 'waitlist_capture' = 'not_informed', appointment?: AppointmentContext): Promise<Call> {
+export async function startCall(brainId: string, patientName: string, rawPhone: string, contactContext: 'not_informed' | 'recent_card_member' | 'appointment_confirmation' | 'missed_appointment' | 'waitlist_capture' | 'card_pitch' = 'not_informed', appointment?: AppointmentContext): Promise<Call> {
   if (!brainId || !patientName?.trim() || patientName.length > 120 || !rawPhone) throw new PublicError(400,'Informe cérebro, nome e telefone válidos.');
-  if (!['not_informed','recent_card_member','appointment_confirmation','missed_appointment','waitlist_capture'].includes(contactContext)) throw new PublicError(400,'Origem do contato inválida.');
+  if (!['not_informed','recent_card_member','appointment_confirmation','missed_appointment','waitlist_capture','card_pitch'].includes(contactContext)) throw new PublicError(400,'Origem do contato inválida.');
   const phone = normalizePhone(rawPhone);
   await ensureElevenLabsCredits();
   const brain = await repo.getBrain(brainId);
@@ -157,7 +157,9 @@ async function updateStatusUnlocked(call: Call, status: CallStatus, duration?: n
   if (terminal) {
     void deliverAutomation(updated);
     void reviewCall(updated);
-    if (status === 'no_answer' || status === 'voicemail') void sendMissedConfirmationWhatsapp(updated);
+    const whatsapp = (status === 'no_answer' || status === 'voicemail') ? sendMissedConfirmationWhatsapp(updated) : Promise.resolve<WhatsappOutcome>('none');
+    void whatsapp;
+    void logCallInContactNote(updated, whatsapp);
   }
   return updated;
 }
@@ -169,16 +171,17 @@ function renderWhatsappPlaceholders(body: string, values: Record<string, string>
  * postal), manda sozinho um WhatsApp de confirmação com os dados da consulta, usando o modelo
  * "confirmacao_nao_atendeu" (editável na aba Automações). Se o número não tiver WhatsApp, o próprio
  * envio falha e fica registrado no log de mensagens; não trava nem repete sozinho. */
-async function sendMissedConfirmationWhatsapp(call: Call): Promise<void> {
+type WhatsappOutcome = 'none' | 'sent' | 'failed';
+async function sendMissedConfirmationWhatsapp(call: Call): Promise<WhatsappOutcome> {
   const appointment = (call.metadata as { appointment?: AppointmentContext } | null)?.appointment;
   // Ligação de confirmação nunca grava "kind" no metadata (só faltosos/lista de espera gravam o próprio
   // kind) — então kind ausente também conta como confirmação, só exclui quando for explicitamente outra coisa.
-  if (!appointment || appointment.kind === 'missed' || appointment.kind === 'waitlist' || appointment.test) return;
+  if (!appointment || appointment.kind === 'missed' || appointment.kind === 'waitlist' || appointment.test) return 'none';
   try {
-    if (await repo.isDoNotContact(call.phone)) return;
-    if (!(await whatsappStatus()).loggedIn) { console.error('[WHATSAPP] confirmação automática pulada: WhatsApp Web não conectado.'); return; }
+    if (await repo.isDoNotContact(call.phone)) return 'none';
+    if (!(await whatsappStatus()).loggedIn) { console.error('[WHATSAPP] confirmação automática pulada: WhatsApp Web não conectado.'); return 'none'; }
     const tpl = await repo.getTemplateBySlug('confirmacao_nao_atendeu');
-    if (!tpl || !tpl.isActive) return;
+    if (!tpl || !tpl.isActive) return 'none';
     const firstName = call.patientName.trim().split(/\s+/)[0] || call.patientName;
     const body = renderWhatsappPlaceholders(tpl.body, {
       nome_paciente: firstName,
@@ -188,7 +191,34 @@ async function sendMissedConfirmationWhatsapp(call: Call): Promise<void> {
       horario_consulta: appointment.time,
     });
     await queueWhatsapp({ callId: call.id, patientName: call.patientName, phone: call.phone, slug: tpl.slug, body, source: 'ia' });
-  } catch (error) { console.error('[WHATSAPP] confirmação automática falhou:', error instanceof Error ? error.message : error); }
+    return 'sent';
+  } catch (error) { console.error('[WHATSAPP] confirmação automática falhou:', error instanceof Error ? error.message : error); return 'failed'; }
+}
+/** Registra na Observação do contato (aba Contatos) cada tentativa de ligação: dia e horário, o que aconteceu
+ * (não atendeu, caixa postal, atendeu e confirmou etc.) e se foi mandada mensagem por WhatsApp. Não grava teste. */
+const callTimeFormat = new Intl.DateTimeFormat('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit', timeZone: 'America/Sao_Paulo' });
+async function logCallInContactNote(call: Call, whatsapp: Promise<WhatsappOutcome>): Promise<void> {
+  try {
+    const meta = call.metadata as { appointment?: { kind?: string; test?: boolean }; test?: boolean; confirmation?: { outcome?: string }; missed?: { outcome?: string } } | null;
+    if (meta?.test || meta?.appointment?.test) return;
+    const kind = meta?.appointment?.kind;
+    const what = kind === 'missed' ? 'recuperação de consulta perdida' : kind === 'waitlist' ? 'lista de espera' : meta?.appointment ? 'confirmação de consulta' : 'contato';
+    const [date, time] = callTimeFormat.format(new Date(call.startedAt ?? call.createdAt)).split(', ');
+    let result: string;
+    if (call.status === 'no_answer') result = 'não atendeu';
+    else if (call.status === 'voicemail') result = 'caiu na caixa postal';
+    else if (call.status === 'busy') result = 'número ocupado';
+    else if (call.status === 'failed') result = 'a ligação falhou';
+    else if (call.status === 'canceled') result = 'ligação cancelada';
+    else {
+      const outcome = meta?.confirmation?.outcome ?? meta?.missed?.outcome;
+      const labels: Record<string, string> = { confirmou: 'atendeu e CONFIRMOU a consulta', desmarcou: 'atendeu e DESMARCOU a consulta', remarcar: 'atendeu e quer remarcar', remarcar_horario: 'atendeu e escolheu um horário para remarcar', lista_espera: 'atendeu e foi para a lista de espera', outro_interesse: 'atendeu e tem outro interesse', sem_interesse: 'atendeu, sem interesse em remarcar' };
+      result = (outcome && labels[outcome]) || (call.answeredAt ? 'atendeu, mas não confirmou nem desmarcou' : 'ligação encerrada sem atender');
+    }
+    const sent = await whatsapp;
+    const extra = sent === 'sent' ? ' Enviei mensagem por WhatsApp; ainda sem confirmação.' : sent === 'failed' ? ' Tentei enviar WhatsApp, mas não foi possível.' : '';
+    await repo.aiUpdateContact(call.phone, { note: `Liguei dia ${date} às ${time} (${what}): ${result}.${extra}` });
+  } catch (error) { console.error('[CONTATOS] observação da ligação não registrada:', error instanceof Error ? error.message : error); }
 }
 // Registro + revisão: busca a transcrição/análise da ElevenLabs depois que a ligação termina e sinaliza
 // automaticamente ligações com problema, pra você revisar sem precisar pedir pra olhar uma por uma. A
@@ -380,6 +410,7 @@ export async function sendTestWhatsapp(rawPhone: string, templateId: string): Pr
 export async function handleAgentTool(callId: string, phone: string, patientName: string, name: string, params: Record<string, unknown>, appointment?: AppointmentContext): Promise<string> {
   if (name === 'registrar_confirmacao') return registerConfirmation(callId, appointment, params);
   if (name === 'registrar_faltoso') return registerMissed(callId, phone, appointment, params);
+  if (name === 'agendar_consulta') return requestBooking(callId, phone, appointment, params);
   if (name === 'enviar_whatsapp') {
     const slug = cleanToolText(params.modelo, 40)?.toLowerCase();
     if (!slug) return 'Informe qual modelo enviar.';
@@ -460,6 +491,9 @@ export async function startConfirmationCall(brainId: string, appointmentId: stri
   return call;
 }
 
+/** Pausa entre uma ligação e a próxima da esteira (o webphone do cVortex precisa assentar antes de recarregar). Mais longa se a anterior deu erro. */
+const ESTEIRA_PAUSE_MS = 6_000;
+const ESTEIRA_PAUSE_AFTER_ERROR_MS = 15_000;
 // ─── Esteira: liga um agendamento atrás do outro sozinha até acabar a lista ou ser desligada ────
 export interface AutoConfirmStartFrom { appointmentId: string; direction: 'up' | 'down' }
 export interface AutoConfirmStatus { active: boolean; current: string | null; currentCallId: string | null; remaining: number; calledCount: number; lastError: string | null; startedAt: string | null }
@@ -473,7 +507,7 @@ export function autoConfirmStatus(): AutoConfirmStatus {
 }
 
 export function startAutoConfirm(brainId: string, filters: ConfirmFilters, startFrom?: AutoConfirmStartFrom): void {
-  if (autoConfirm?.active) throw new PublicError(409, 'A esteira já está ligando sozinha.');
+  if (autoConfirm?.active || captacaoAuto?.active) throw new PublicError(409, 'A esteira já está ligando sozinha.');
   if (!brainId) throw new PublicError(400, 'Selecione um cérebro.');
   autoConfirm = { active: true, brainId, filters: { ...filters, statusId: 2 }, startFrom: startFrom ?? null, attempted: new Set(), current: null, currentCallId: null, remaining: 0, calledCount: 0, lastError: null, startedAt: new Date().toISOString() };
   void runAutoConfirm(autoConfirm);
@@ -486,6 +520,9 @@ export function stopAutoConfirm(): void {
 async function waitForCallToFinish(appointmentId: string): Promise<void> {
   const callId = callsByAppointment.get(appointmentId);
   if (!callId) return;
+  await waitForCallId(callId);
+}
+async function waitForCallId(callId: string): Promise<void> {
   const call = await getManagedCall(callId);
   if (!call || TERMINAL_STATUSES.includes(call.status)) return;
   await new Promise<void>(resolve => {
@@ -522,7 +559,7 @@ async function runAutoConfirm(state: AutoConfirmState): Promise<void> {
     state.current = null;
     state.currentCallId = null;
     if (!state.active) break;
-    await new Promise(resolve => setTimeout(resolve, 4000));   // respiro entre uma ligação e outra
+    await new Promise(resolve => setTimeout(resolve, state.lastError ? ESTEIRA_PAUSE_AFTER_ERROR_MS : ESTEIRA_PAUSE_MS));   // respiro entre uma ligação e outra
   }
   state.current = null;
   state.currentCallId = null;
@@ -610,13 +647,20 @@ function confirmationPromptFor(a: AppointmentContext): string {
 }
 
 // ─── Faltosos: recuperação de consulta perdida (AMEI) ────────────────────────────────────────────
+/** Texto das especialidades que ela agenda sozinha nesta ligação (vazio em teste ou se não há liberação). */
+function bookableText(a: AppointmentContext): string | undefined {
+  if (a.test || !bookingSpecialties().length) return undefined;
+  return (process.env.BOOKING_SPECIALTIES_LABEL ?? 'Clínico Geral (Clínica médica)');
+}
 function promptFor(a: AppointmentContext): string {
-  if (a.kind === 'waitlist') return buildWaitlistPrompt({ patientName: a.patientName, specialty: a.specialty, professional: a.professional || undefined, greeting: greetingForNow() });
+  if (a.kind === 'card') { const v = appointmentVariables(a); const ref = cardReferencePrice(a.specialty); const paidNumber = Number(a.valor); return buildCardPitchPrompt({ patientName: v.patient_name!, day: v.consulta_dia!, time: v.consulta_hora!, professional: v.consulta_profissional!, specialty: v.consulta_especialidade!, paid: spokenMoney(a.valor ?? '') || 'o valor particular', cardPrice: ref ? spokenMoney(String(ref)) : '', saving: ref != null && Number.isFinite(paidNumber) && paidNumber > ref, greeting: greetingForNow() }); }
+  if (a.kind === 'waitlist') return buildWaitlistPrompt({ patientName: a.patientName, specialty: a.specialty, professional: a.professional || undefined, greeting: greetingForNow(), bookable: bookableText(a) });
   if (a.kind !== 'missed') return confirmationPromptFor(a);
   const v = appointmentVariables(a);
-  return buildMissedPrompt({ patientName: v.patient_name!, day: v.consulta_dia!, time: v.consulta_hora!, professional: v.consulta_profissional!, specialty: v.consulta_especialidade!, situation: missedSituationOf(a.statusId), greeting: greetingForNow(), recoveryStatus: a.recovery?.status, recoveryNext: a.recovery?.next });
+  return buildMissedPrompt({ patientName: v.patient_name!, day: v.consulta_dia!, time: v.consulta_hora!, professional: v.consulta_profissional!, specialty: v.consulta_especialidade!, situation: missedSituationOf(a.statusId), greeting: greetingForNow(), recoveryStatus: a.recovery?.status, recoveryNext: a.recovery?.next, bookable: bookableText(a) });
 }
 function firstMessageFor(a: AppointmentContext): string {
+  if (a.kind === 'card') return cardPitchFirstMessage(greetingForNow(), a.patientName);
   if (a.kind === 'waitlist') return waitlistFirstMessage(greetingForNow(), a.patientName);
   const name = appointmentVariables(a).patient_name!;
   return a.kind === 'missed' ? missedFirstMessage(greetingForNow(), name) : confirmationFirstMessage(greetingForNow(), name);
@@ -642,6 +686,28 @@ export async function startMissedCall(brainId: string, appointmentId: string): P
   catch (error) { throw new PublicError(409, error instanceof AmeiError ? error.message : 'Não foi possível ler a consulta na AMEI.'); }
   const call = await startCall(brainId, context.patientName, context.phone, 'missed_appointment', context);
   callsByAppointment.set(appointmentId, call.id);
+  return call;
+}
+
+const CARD_RECENT_MS = 30 * 24 * 3600_000;
+/** Liga para um paciente atendido como particular que ainda não tem o Cartão de TODOS, para apresentar o cartão. Dados lidos da AMEI na hora. */
+export async function startCardCall(brainId: string, appointmentId: string): Promise<Call> {
+  if (!/^\d{1,12}$/.test(appointmentId)) throw new PublicError(400, 'Consulta inválida.');
+  if (!(await ameiStatus()).loggedIn) throw new PublicError(503, 'A AMEI não está conectada. Entre na AMEI pela aba Automações.');
+  const key = `card:${appointmentId}`;
+  const previousId = callsByAppointment.get(key);
+  if (previousId) {
+    const previous = await getManagedCall(previousId);
+    if (previous && !TERMINAL_STATUSES.includes(previous.status)) throw new PublicError(409, 'Já existe uma ligação em andamento para esse paciente.');
+  }
+  let context: AppointmentContext;
+  try { context = await ameiCardContext(appointmentId); }
+  catch (error) { throw new PublicError(409, error instanceof AmeiError ? error.message : 'Não foi possível ler a consulta na AMEI.'); }
+  // Não incomoda duas vezes com o cartão: se já falamos com esse paciente sobre isso nos últimos 30 dias, pula.
+  const recent = (await listManagedCalls()).find(c => c.metadata?.contact_context === 'card_pitch' && c.phone === context.phone && c.status === 'completed' && Date.now() - new Date(c.createdAt ?? 0).getTime() < CARD_RECENT_MS);
+  if (recent) throw new PublicError(409, 'Já falamos com esse paciente sobre o Cartão de TODOS nos últimos 30 dias.');
+  const call = await startCall(brainId, context.patientName, context.phone, 'card_pitch', context);
+  callsByAppointment.set(key, call.id);
   return call;
 }
 
@@ -699,7 +765,7 @@ const MISSED_OUTCOMES = ['remarcar_horario', 'lista_espera', 'sem_interesse', 'o
 
 /** Ferramenta registrar_faltoso: só mexe na consulta perdida DESTA ligação. A única escrita na AMEI é a lista de espera. */
 async function registerMissed(callId: string, phone: string, appointment: AppointmentContext | undefined, params: Record<string, unknown>): Promise<string> {
-  if (!appointment || (appointment.kind !== 'missed' && appointment.kind !== 'waitlist')) return 'Esta ligação não é de recuperação de consulta perdida nem de captação da lista de espera; não use esta ferramenta.';
+  if (!appointment || (appointment.kind !== 'missed' && appointment.kind !== 'waitlist' && appointment.kind !== 'card')) return 'Esta ligação não é de recuperação de consulta perdida, de lista de espera nem do Cartão de TODOS; não use esta ferramenta.';
   const outcome = cleanToolText(params.resultado, 24)?.toLowerCase() ?? '';
   if (!MISSED_OUTCOMES.includes(outcome)) return 'Informe o resultado: remarcar_horario, lista_espera, sem_interesse ou outro_interesse.';
   const reason = cleanToolText(params.motivo_falta, 160);
@@ -741,5 +807,202 @@ async function registerMissed(callId: string, phone: string, appointment: Appoin
     console.error('[AMEI] lista de espera falhou:', error instanceof Error ? error.message : error);
     await repo.appendEvent(callId, 'ai.missed_failed', { appointment_id: appointment.appointmentId, outcome, reason: error instanceof Error ? error.message : 'erro' });
     return `Não consegui registrar agora${error instanceof AmeiError ? ` (${error.message})` : ''}. Diga que a equipe faz o registro, sem afirmar que colocou na lista, e siga o roteiro.`;
+  }
+}
+
+
+// ─── Confirmação pelo WhatsApp: quem recebeu a mensagem automática e respondeu "sim" é confirmado na AMEI ──
+const plain = (value: string): string => value.normalize('NFD').replace(/\p{M}+/gu, '').toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim();
+/** Só "sim" claro e curto vira confirmação. Qualquer negação, pedido de mudança ou dúvida vira 'other' (um humano resolve). */
+export function classifyWhatsappReply(text: string): 'yes' | 'other' {
+  const t = plain(text);
+  if (/👍/u.test(text) && t.length === 0) return 'yes';
+  if (!t || t.split(' ').length > 8 || text.includes('?')) return 'other';
+  if (/\b(nao|nunca|cancel\w*|desmarc\w*|remarc\w*|mudar|trocar|outro|outra|reagend\w*|duvida|infelizmente|nao vou|nao posso|quem|errado|engano|mas|posso|podemos|queria|preciso|quero|horario|dia|qual|quanto|onde)\b/.test(t)) return 'other';
+  if (/^(sim|siim|simm|s|ss|ok|okay|okk|oks|certo|claro|pode|confirmo|confirmado|confirmada|combinado|blz|beleza|tudo certo|ta bom|ta certo|ta confirmado|vou sim|estarei la|estarei presente|presente|com certeza|pode confirmar|pode ser)( |$)/.test(t)) return 'yes';
+  if (/\b(confirmo|confirmado|confirmada|estarei|vou sim)\b/.test(t)) return 'yes';
+  return 'other';
+}
+const REPLY_WINDOW_MS = 7 * 24 * 3600 * 1000;
+const lastReplyCheck = new Map<string, number>();
+let replyCheckRunning = false;
+export async function checkWhatsappReplies(limit = 20): Promise<void> {
+  if (replyCheckRunning) return;
+  replyCheckRunning = true;
+  try {
+    if (!(await whatsappStatus()).loggedIn || !(await ameiStatus()).loggedIn) return;
+    const messages = (await repo.listMessages(500)).filter(m => m.source === 'ia' && m.status === 'sent' && m.templateSlug === 'confirmacao_nao_atendeu' && m.callId && m.sentAt && Date.now() - Date.parse(m.sentAt) < REPLY_WINDOW_MS);
+    console.info('[WHATSAPP] mensagens de confirmação aguardando resposta:', messages.length);
+    const seen = new Set<string>();
+    const queue = messages.filter(m => (seen.has(m.callId!) ? false : (seen.add(m.callId!), true))).sort((a, b) => (lastReplyCheck.get(a.callId!) ?? 0) - (lastReplyCheck.get(b.callId!) ?? 0)).slice(0, limit);
+    for (const message of queue) {
+      lastReplyCheck.set(message.callId!, Date.now());
+      const call = await getManagedCall(message.callId!);
+      const meta = call?.metadata as { appointment?: { appointmentId?: string; date?: string; time?: string; specialty?: string; test?: boolean }; whatsapp_reply?: unknown } | null | undefined;
+      const appt = meta?.appointment;
+      if (!call || meta?.whatsapp_reply || !appt?.appointmentId || !appt.date || !appt.time || appt.test) continue;
+      if (appt.date < new Date().toLocaleDateString('sv-SE', { timeZone: 'America/Sao_Paulo' })) continue; // consulta já passou: não confirma
+      if (await repo.isDoNotContact(message.phone)) continue;
+      const anchor = message.body.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '').slice(0, 40);
+      const replies = await readWhatsappReplies(message.phone, anchor).catch((error: unknown) => { console.error('[WHATSAPP] leitura da conversa falhou:', error instanceof Error ? error.message : error); return [] as string[]; });
+      console.info('[WHATSAPP] respostas lidas', message.phone.slice(-4), replies.length);
+      if (!replies.length) continue;
+      const kinds = replies.map(classifyWhatsappReply);
+      const stamp = new Intl.DateTimeFormat('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit', timeZone: 'America/Sao_Paulo' }).format(new Date()).replace(', ', ' às ');
+      let outcome: 'confirmou' | 'other' | 'erro' = 'other';
+      let note: string;
+      if (kinds.every(kind => kind === 'yes')) {
+        try {
+          await ameiApplyOutcome({ appointmentId: appt.appointmentId, date: appt.date, time: appt.time }, 'confirmou', 'whatsapp');
+          outcome = 'confirmou';
+          const first = call.patientName.trim().split(/\s+/)[0] || call.patientName;
+          const thanks = `Consulta confirmada com sucesso! ${first}, sua consulta de ${appt.specialty ?? ''} no dia ${dmy(appt.date)} às ${appt.time} está confirmada. Muito obrigada! — Clínica Amor Saúde`.replace(/\s{2,}/g, ' ');
+          await queueWhatsapp({ callId: call.id, patientName: call.patientName, phone: message.phone, slug: null, body: thanks, source: 'ia' }).catch(() => undefined);
+          note = `Respondeu "${replies[0]}" no WhatsApp (${stamp}): consulta de ${dmy(appt.date)} às ${appt.time} CONFIRMADA na AMEI pelo WhatsApp.`;
+        } catch (error) {
+          if (!(error instanceof AmeiError)) { console.error('[WHATSAPP] confirmação pela AMEI falhou, tento de novo depois:', error instanceof Error ? error.message : error); continue; }
+          outcome = 'erro';
+          note = `Respondeu "${replies[0]}" no WhatsApp (${stamp}), mas não consegui confirmar na AMEI: ${error.message}`;
+        }
+      } else {
+        note = `Respondeu no WhatsApp (${stamp}): "${replies.join(' | ').slice(0, 300)}". Não confirmei sozinha; precisa de atenção.`;
+      }
+      const updated = await updateManagedCall(call, { metadata: { ...(call.metadata ?? {}), whatsapp_reply: { outcome, at: new Date().toISOString(), text: replies.join(' | ').slice(0, 300) } } });
+      publish(updated);
+      void repo.appendEvent(call.id, 'whatsapp.reply', { outcome, replies });
+      await repo.aiUpdateContact(message.phone, { note }).catch(() => undefined);
+      console.info('[WHATSAPP] resposta processada', call.id, outcome);
+    }
+  } catch (error) { console.error('[WHATSAPP] verificação de respostas falhou:', error instanceof Error ? error.message : error); }
+  finally { replyCheckRunning = false; }
+}
+export function startWhatsappReplyWatcher(): void {
+  if (process.env.NODE_ENV === 'test') return;
+  // Ao ligar o servidor já passa por quem respondeu antes (até 7 dias), depois repete a cada 2 minutos.
+  setTimeout(() => { void checkWhatsappReplies(80); }, 30_000).unref();
+  setInterval(() => { void checkWhatsappReplies(); }, 2 * 60 * 1000).unref();
+}
+
+
+// ─── Esteira da Captação: liga um paciente atrás do outro da lista da busca, a partir de quem o operador escolher ──
+export interface CaptacaoAutoStatus { active: boolean; current: string | null; currentCallId: string | null; remaining: number; calledCount: number; lastError: string | null; startedAt: string | null }
+interface CaptacaoAutoState extends CaptacaoAutoStatus { brainId: string; queue: Array<{ id: string; mode: 'faltosos' | 'lista_espera' | 'cartao'; phone: string }>; }
+let captacaoAuto: CaptacaoAutoState | null = null;
+export function captacaoAutoStatus(): CaptacaoAutoStatus {
+  if (!captacaoAuto) return { active: false, current: null, currentCallId: null, remaining: 0, calledCount: 0, lastError: null, startedAt: null };
+  const { active, current, currentCallId, remaining, calledCount, lastError, startedAt } = captacaoAuto;
+  return { active, current, currentCallId, remaining, calledCount, lastError, startedAt };
+}
+export function startCaptacaoAuto(brainId: string, jobId: string, startFrom?: { id: string; direction: 'up' | 'down' }): void {
+  if (captacaoAuto?.active || autoConfirm?.active) throw new PublicError(409, 'A esteira já está ligando sozinha.');
+  if (!brainId) throw new PublicError(400, 'Selecione um cérebro.');
+  let rows;
+  try { rows = getCampaignSearch(jobId).results; }
+  catch (error) { throw new PublicError(409, error instanceof AmeiError ? error.message : 'Busca não encontrada; faça a busca de novo.'); }
+  // Mesma ordem da tela: "de cima pra baixo" segue a lista a partir do escolhido; "de baixo pra cima" começa nele e sobe.
+  if (startFrom) {
+    const anchor = rows.findIndex(row => row.id === startFrom.id);
+    if (anchor >= 0) rows = startFrom.direction === 'up' ? rows.slice(0, anchor + 1).reverse() : rows.slice(anchor);
+  }
+  const queue = rows.filter(row => row.phone.length >= 10).map(row => ({ id: row.id, mode: row.mode, phone: row.phone }));
+  if (!queue.length) throw new PublicError(409, 'Nenhum paciente na lista para ligar.');
+  captacaoAuto = { active: true, brainId, queue, current: null, currentCallId: null, remaining: queue.length, calledCount: 0, lastError: null, startedAt: new Date().toISOString() };
+  void runCaptacaoAuto(captacaoAuto);
+}
+export function stopCaptacaoAuto(): void { if (captacaoAuto) captacaoAuto.active = false; }
+async function runCaptacaoAuto(state: CaptacaoAutoState): Promise<void> {
+  while (state.active && state.queue.length) {
+    const next = state.queue.shift()!;
+    state.remaining = state.queue.length;
+    state.current = next.id;
+    try {
+      const call = next.mode === 'faltosos' ? await startMissedCall(state.brainId, next.id) : next.mode === 'cartao' ? await startCardCall(state.brainId, next.id) : await startWaitlistCall(state.brainId, next.id);
+      state.currentCallId = call.id; state.calledCount++; state.lastError = null;
+      await waitForCallId(call.id);
+    } catch (error) { state.lastError = error instanceof Error ? error.message : 'Não foi possível ligar.'; }   // ex.: já ligou há pouco, já reagendou: pula pro próximo
+    state.current = null; state.currentCallId = null;
+    if (!state.active) break;
+    await new Promise(resolve => setTimeout(resolve, state.lastError ? ESTEIRA_PAUSE_AFTER_ERROR_MS : ESTEIRA_PAUSE_MS));
+  }
+  state.active = false; state.current = null; state.currentCallId = null;
+}
+
+
+// ─── Agendamento pela Giovana (Fase 1): ela propõe, o operador aprova no painel, o sistema agenda na AMEI ──
+/** Especialidades que ela pode propor agendar (BOOKING_SPECIALTIES, separadas por vírgula; padrão: Clínico Geral = "Clínica médica"). */
+const bookingNorm = (value: string): string => value.normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().trim();
+export function bookingSpecialties(): string[] {
+  return (process.env.BOOKING_SPECIALTIES ?? 'clinica medica').split(',').map(bookingNorm).filter(Boolean);
+}
+const BOOKING_WAIT_MS = 80_000;
+export interface BookingProposalView { status: 'pending' | 'booking' | 'booked' | 'rejected' | 'expired' | 'failed'; patient: string; specialty: string; professional: string; date: string; time: string; partner: string; procedure: string; local: string; price: number; appointmentId?: string; message?: string; at: string }
+interface PendingBooking { plan: BookingPlan; decide: (decision: 'approve' | 'reject') => void }
+const pendingBookings = new Map<string, PendingBooking>();
+
+async function setBookingView(callId: string, view: BookingProposalView): Promise<void> {
+  const current = await getManagedCall(callId);
+  if (!current) return;
+  publish(await updateManagedCall(current, { metadata: { ...(current.metadata || {}), booking_proposal: view } }));
+}
+const bookingViewOf = (plan: BookingPlan, status: BookingProposalView['status'], extra: Partial<BookingProposalView> = {}): BookingProposalView => ({
+  status, patient: (plan.patientName.split(' ')[0] ?? '').replace(/^./, c => c.toLocaleUpperCase('pt-BR')), specialty: plan.specialty, professional: plan.professional, date: plan.date, time: plan.time,
+  partner: plan.partner, procedure: plan.procedure, local: plan.local, price: plan.price, at: new Date().toISOString(), ...extra,
+});
+
+/** O operador clicou em Agendar ou Recusar no painel. */
+export function decideBooking(callId: string, decision: 'approve' | 'reject'): void {
+  const pending = pendingBookings.get(callId);
+  if (!pending) throw new PublicError(409, 'Não há agendamento aguardando aprovação nesta ligação (pode ter expirado).');
+  pending.decide(decision);
+}
+
+/** Ferramenta agendar_consulta: valida na AMEI, mostra a proposta no painel e espera o operador. */
+async function requestBooking(callId: string, phone: string, appointment: AppointmentContext | undefined, params: Record<string, unknown>): Promise<string> {
+  if (appointment?.test) return 'TESTE: esta ligação é fictícia, nada foi agendado. Diga ao paciente que a equipe confirma o horário e siga o roteiro.';
+  if (pendingBookings.has(callId)) return 'Já existe um agendamento aguardando aprovação nesta ligação. Aguarde.';
+  const especialidade = cleanToolText(params.especialidade, 80), data = cleanToolText(params.data, 20), horario = cleanToolText(params.horario, 10);
+  if (!especialidade || !data || !horario) return 'Informe especialidade, data e horário do horário que o paciente escolheu.';
+  const fallback = 'Diga com naturalidade que o Marcos confirma o horário com ele (chame registrar_faltoso com resultado="remarcar_horario" e horario_escolhido) e NÃO diga que agendou.';
+  let plan: BookingPlan;
+  try {
+    const target = await ameiResolveBooking({ especialidade, profissional: cleanToolText(params.profissional, 80), data, horario });
+    if (!bookingSpecialties().includes(bookingNorm(target.specialty))) return `Por enquanto você não agenda ${target.specialty} sozinha. ${fallback}`;
+    const cpf = await ameiCpfForContext({ appointmentId: appointment?.appointmentId, patientId: appointment?.patientId });
+    plan = await ameiPrepareBooking({ ...target, cpf });
+  } catch (error) {
+    console.error('[AGENDAMENTO] preparação falhou:', error instanceof Error ? error.message : error);
+    await repo.appendEvent(callId, 'ai.booking_unavailable', { reason: error instanceof Error ? error.message : 'erro' });
+    return `Não consegui reservar esse horário${error instanceof AmeiError ? ` (${error.message})` : ''}. Peça desculpas, ofereça outro horário da lista ou, se não der, ${fallback}`;
+  }
+  await repo.appendEvent(callId, 'ai.booking_proposed', { date: plan.date, time: plan.time, specialty_id: plan.specialtyId, professional_id: plan.professionalId });
+  const decision = await new Promise<'approve' | 'reject' | 'timeout'>(resolve => {
+    const timer = setTimeout(() => { pendingBookings.delete(callId); resolve('timeout'); }, BOOKING_WAIT_MS);
+    pendingBookings.set(callId, { plan, decide: d => { clearTimeout(timer); pendingBookings.delete(callId); resolve(d); } });
+    void setBookingView(callId, bookingViewOf(plan, 'pending')).catch(() => undefined);
+  });
+  if (decision === 'timeout') {
+    await setBookingView(callId, bookingViewOf(plan, 'expired')).catch(() => undefined);
+    return `Ninguém aprovou a tempo. Diga que o Marcos confirma o horário em instantes; ${fallback}`;
+  }
+  if (decision === 'reject') {
+    await setBookingView(callId, bookingViewOf(plan, 'rejected')).catch(() => undefined);
+    await repo.appendEvent(callId, 'ai.booking_rejected', {});
+    return `O Marcos não aprovou esse horário. Peça desculpas, ofereça outro horário da lista ou diga que ele confirma depois (${fallback})`;
+  }
+  await setBookingView(callId, bookingViewOf(plan, 'booking')).catch(() => undefined);
+  try {
+    const result = await ameiBook(plan, 'Agendado pela assistente virtual Giovana (IA), aprovado pela equipe.');
+    await setBookingView(callId, bookingViewOf(plan, 'booked', { appointmentId: result.appointmentId })).catch(() => undefined);
+    await repo.appendEvent(callId, 'ai.booking_done', { appointment_id: result.appointmentId });
+    const when = `${plan.date.split('-').reverse().join('/')} às ${plan.time}`;
+    await repo.aiUpdateContact(phone, { note: `Agendado pela Giovana: ${plan.specialty}, ${when}, com ${plan.professional} (${plan.partner}, R$ ${plan.price}).` }).catch(() => undefined);
+    const current = await getManagedCall(callId);
+    if (current) publish(await updateManagedCall(current, { result: 'interested' }));
+    return `AGENDADO com sucesso: ${plan.specialty}, ${spokenLongDay(plan.date)}, às ${spokenClock(plan.time)}, com ${plan.professional}, ${plan.local}. Valor: ${spokenMoney(String(plan.price)) || 'conforme a tabela'} (${plan.partner}). Confirme isso ao paciente em frases curtas, pergunte se precisa de mais alguma coisa e depois se despeça uma única vez e encerre com end_call.`;
+  } catch (error) {
+    console.error('[AGENDAMENTO] falhou:', error instanceof Error ? error.message : error);
+    await setBookingView(callId, bookingViewOf(plan, 'failed', { message: error instanceof Error ? error.message : 'Erro ao agendar.' })).catch(() => undefined);
+    await repo.appendEvent(callId, 'ai.booking_failed', { reason: error instanceof Error ? error.message : 'erro' });
+    return `Não consegui concluir o agendamento${error instanceof AmeiError ? ` (${error.message})` : ''}. NÃO diga que agendou. ${fallback}`;
   }
 }

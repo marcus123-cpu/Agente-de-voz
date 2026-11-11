@@ -130,11 +130,34 @@ export function LiveListen({ callId, active, humanTakeover, compact = false }: {
   }, [phase])
 
   const listening = phase === 'on'
+  // Widget compacto: a escuta começa sozinha com a ligação (a saída de som é só a do painel, desde o toque).
+  // Se o operador parar de ouvir, não religa sozinha naquela ligação.
+  const autoStarted = useRef<string | null>(null)
+  useEffect(() => {
+    if (!compact || !active || humanTakeover || autoStarted.current === callId) return
+    autoStarted.current = callId
+    void start()
+  }, [compact, active, humanTakeover, callId, start])
+  // Atalho Numpad 1 (só no widget compacto): liga/desliga a escuta, fora de campos de texto.
+  const toggleRef = useRef<() => void>(() => {})
+  toggleRef.current = () => { if (listening || phase === 'connecting') stop(); else if (active && !humanTakeover) void start() }
+  useEffect(() => {
+    if (!compact) return
+    function onKey(event: KeyboardEvent) {
+      if (event.code !== 'Numpad1' || event.repeat || event.ctrlKey || event.altKey || event.metaKey) return
+      const target = event.target as HTMLElement | null
+      if (target && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName))) return
+      event.preventDefault()
+      toggleRef.current()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [compact])
   if (compact) {
     return <>
       {listening || phase === 'connecting'
-        ? <button className="cw-act cw-act-on" onClick={stop}><Square size={13}/>Parar de ouvir</button>
-        : <button className="cw-act" disabled={!active || humanTakeover} title={humanTakeover ? 'Você assumiu: o áudio passa pelo webphone' : undefined} onClick={() => void start()}><Headphones size={13}/>Ouvir</button>}
+        ? <button className="cw-act cw-act-on" onClick={stop}><Square size={13}/>Parar de ouvir [1]</button>
+        : <button className="cw-act" disabled={!active || humanTakeover} title={humanTakeover ? 'Você assumiu: o áudio passa pelo webphone' : undefined} onClick={() => void start()}><Headphones size={13}/>Ouvir [1]</button>}
       {error && <small className="cw-err">{error}</small>}
     </>
   }

@@ -1,7 +1,8 @@
-import { useEffect, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react'
+import { useCallback, useEffect, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react'
 import { CheckCircle2, Hand, PhoneCall, PhoneOff, RotateCcw, X, XCircle } from 'lucide-react'
 import type { Call, CallStatus } from './types'
 import { LiveListen } from './LiveListen'
+import { api } from './api'
 
 const DRAG_STORAGE_KEY = 'cw-position'
 /** Arrasta o widget pelo cabeçalho (ignora cliques em botões) e lembra a posição entre ligações. */
@@ -45,7 +46,8 @@ const statusText: Record<CallStatus, string> = { idle: 'Aguardando', connecting:
 const finished: CallStatus[] = ['completed', 'failed', 'busy', 'no_answer', 'canceled', 'voicemail']
 const weekdays = ['dom', 'seg', 'ter', 'qua', 'qui', 'sex', 'sáb']
 
-interface AppointmentMeta { date?: string; time?: string; specialty?: string; professional?: string; test?: boolean; kind?: string }
+interface BookingView { status: 'pending' | 'booking' | 'booked' | 'rejected' | 'expired' | 'failed'; patient: string; specialty: string; professional: string; date: string; time: string; partner: string; procedure: string; local: string; price: number; appointmentId?: string; message?: string }
+interface AppointmentMeta { date?: string; time?: string; specialty?: string; professional?: string; test?: boolean; kind?: string; cardStatus?: string }
 function dayLabel(iso?: string) {
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso ?? '')
   return m ? `${weekdays[new Date(Date.UTC(+m[1]!, +m[2]! - 1, +m[3]!)).getUTCDay()]} ${m[3]}/${m[2]}` : ''
@@ -70,6 +72,41 @@ export function CallWidget({ call, elapsed, demo, ending, takingOver, markingAns
   const isMissed = appointment?.kind === 'missed'
   const human = Boolean(call.metadata?.human_takeover)
   const talking = call.status === 'in_progress'
+  // Atalhos no teclado numérico: 0 = Assumir, 1 = Ouvir (no LiveListen), 2 = Encerrar, 3 = Caixa postal (só com ligação em andamento e fora de campos de texto).
+  const shortcuts = useRef({ done, talking, human, ending, takingOver, markingAnswered, markingVoicemail, onTakeover, onEnd, onMarkAnswered, onMarkVoicemail })
+  shortcuts.current = { done, talking, human, ending, takingOver, markingAnswered, markingVoicemail, onTakeover, onEnd, onMarkAnswered, onMarkVoicemail }
+  useEffect(() => {
+    function onKey(event: KeyboardEvent) {
+      const s = shortcuts.current
+      if (s.done || event.repeat || event.ctrlKey || event.altKey || event.metaKey) return
+      const target = event.target as HTMLElement | null
+      if (target && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName))) return
+      if (event.code === 'Numpad0') { if (!s.human && !s.takingOver) { event.preventDefault(); s.onTakeover() } }
+      else if (event.code === 'Numpad2') { if (!s.ending) { event.preventDefault(); s.onEnd() } }
+      else if (event.code === 'Numpad3') { if (!s.human && !s.markingVoicemail) { event.preventDefault(); s.onMarkVoicemail() } }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
+  const booking = (call.metadata?.booking_proposal ?? null) as BookingView | null
+  const [deciding, setDeciding] = useState(false)
+  const decide = useCallback((decision: 'approve' | 'reject') => {
+    setDeciding(true)
+    void api.bookingDecision(call.id, decision).catch(() => undefined).finally(() => setDeciding(false))
+  }, [call.id])
+  const bookingPending = booking?.status === 'pending' && !done
+  const decideRef = useRef(decide); decideRef.current = decide
+  const pendingRef = useRef(bookingPending); pendingRef.current = bookingPending
+  useEffect(() => {
+    function onKey(event: KeyboardEvent) {
+      if (event.code !== 'Numpad4' || event.repeat || !pendingRef.current) return
+      const target = event.target as HTMLElement | null
+      if (target && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName))) return
+      event.preventDefault(); decideRef.current('approve')
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
   const tone = outcome === 'confirmou' || missed === 'lista_espera' ? 'ok' : outcome === 'desmarcou' ? 'bad' : outcome === 'remarcar' || missed === 'remarcar_horario' || missed === 'outro_interesse' ? 'warn' : done ? 'idle' : talking ? 'live' : 'wait'
 
   let result = <span className="cw-result wait"><PhoneCall size={14}/> {talking ? (isMissed ? 'Conversando com o paciente...' : 'Aguardando a resposta do paciente...') : 'Aguardando atender...'}</span>
@@ -91,6 +128,9 @@ export function CallWidget({ call, elapsed, demo, ending, takingOver, markingAns
       {talking && <span className="cw-time">{clock(elapsed)}</span>}
       {human && <span className="cw-badge">Você assumiu</span>}
       {isMissed && <span className="cw-badge">FALTOSO</span>}
+      {appointment?.kind === 'card' && <span className="cw-badge">CARTÃO DE TODOS</span>}
+      {appointment?.cardStatus === 'sem_cartao' && <span className="cw-badge cw-badge-warn">SEM CARTÃO DE TODOS</span>}
+      {appointment?.cardStatus === 'devendo' && <span className="cw-badge cw-badge-warn">CARTÃO EM ATRASO</span>}
       {appointment?.test && <span className="cw-badge">TESTE</span>}
       <button aria-label="Fechar" onClick={onClose}><X size={15}/></button>
     </header>
@@ -100,12 +140,23 @@ export function CallWidget({ call, elapsed, demo, ending, takingOver, markingAns
       {appointment && <small>{appointment.specialty}{appointment.date ? ` · ${dayLabel(appointment.date)} ${appointment.time ?? ''}` : ''}{appointment.professional ? ` · ${appointment.professional}` : ''}</small>}
       {result}
     </div>
+    {booking && <div className={`cw-booking cw-booking-${booking.status}`}>
+      <strong>{booking.status === 'pending' ? 'Agendar esta consulta?' : booking.status === 'booking' ? 'Agendando na AMEI...' : booking.status === 'booked' ? `Agendado na AMEI (nº ${booking.appointmentId})` : booking.status === 'rejected' ? 'Agendamento recusado' : booking.status === 'expired' ? 'Agendamento expirou (a Giovana passou para o Marcos)' : 'Não consegui agendar'}</strong>
+      <span>{booking.patient} · {booking.specialty}</span>
+      <span>{dayLabel(booking.date)} às {booking.time} · {booking.professional}</span>
+      <span>{booking.procedure} · {booking.partner} · R$ {booking.price} · {booking.local}</span>
+      {booking.message && <small className="cw-err">{booking.message}</small>}
+      {bookingPending && <div className="cw-booking-actions">
+        <button className="cw-act cw-act-take" disabled={deciding} onClick={() => decide('approve')}>Agendar [4]</button>
+        <button className="cw-act" disabled={deciding} onClick={() => decide('reject')}>Recusar</button>
+      </div>}
+    </div>}
     {!done && <div className="cw-actions">
       {!demo && <LiveListen compact callId={call.id} active={!done} humanTakeover={human}/>}
       {talking && !human && <button className="cw-act cw-act-take" disabled={markingAnswered} title="Use se perceber que a pessoa atendeu e está falando, mas a Giovana continua muda" onClick={onMarkAnswered}><PhoneCall size={13}/>{markingAnswered ? 'Avisando...' : 'Atendeu'}</button>}
-      {talking && !human && <button className="cw-act cw-act-take" disabled={markingVoicemail} title="Use se perceber que caiu na caixa postal/gravação: desliga e já manda o WhatsApp de confirmação" onClick={onMarkVoicemail}><PhoneOff size={13}/>{markingVoicemail ? 'Marcando...' : 'Caixa postal'}</button>}
-      <button className="cw-act cw-act-take" disabled={human || takingOver} onClick={onTakeover}><Hand size={13}/>{human ? 'Assumida' : takingOver ? 'Assumindo...' : 'Assumir'}</button>
-      <button className="cw-act cw-act-end" disabled={ending} onClick={onEnd}><PhoneOff size={13}/>{ending ? 'Encerrando...' : 'Encerrar'}</button>
+      {!human && <button className="cw-act cw-act-take" disabled={markingVoicemail} title="Use se perceber que caiu na caixa postal/gravação: desliga e já manda o WhatsApp de confirmação" onClick={onMarkVoicemail}><PhoneOff size={13}/>{markingVoicemail ? 'Marcando...' : 'Caixa postal [3]'}</button>}
+      <button className="cw-act cw-act-take" disabled={human || takingOver} onClick={onTakeover}><Hand size={13}/>{human ? 'Assumida' : takingOver ? 'Assumindo...' : 'Assumir [0]'}</button>
+      <button className="cw-act cw-act-end" disabled={ending} onClick={onEnd}><PhoneOff size={13}/>{ending ? 'Encerrando...' : 'Encerrar [2]'}</button>
     </div>}
     <footer><button onClick={onOpen}>Abrir atendimento</button></footer>
   </aside>
