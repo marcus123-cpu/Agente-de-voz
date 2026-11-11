@@ -2,10 +2,10 @@ import { parsePhoneNumberFromString } from 'libphonenumber-js';
 import { config } from './config.js';
 import * as repo from './repository.js';
 import { cvortexReady, startCvortexCall, endCvortexCall, takeoverCvortexCall, markCvortexCallAnswered, greetingForNow } from './cvortex-provider.js';
-import { buildConfirmationPrompt, confirmationFirstMessage, buildMissedPrompt, missedFirstMessage, buildWaitlistPrompt, waitlistFirstMessage, buildAcquisitionPrompt, acquisitionFirstMessage, buildCardPitchPrompt, cardPitchFirstMessage, cardReferencePrice } from './confirm-prompt.js';
+import { buildConfirmationPrompt, confirmationFirstMessage, buildMissedPrompt, missedFirstMessage, buildWaitlistPrompt, waitlistFirstMessage, buildAcquisitionPrompt, acquisitionFirstMessage, buildCardPitchPrompt, cardPitchFirstMessage, cardReferencePrice, buildReactivationPrompt, reactivationFirstMessage } from './confirm-prompt.js';
 import { publishLive } from './live.js';
 import { sendWhatsapp, whatsappStatus, readWhatsappReplies, WhatsappSendError } from './whatsapp.js';
-import { getCampaignSearch, ameiCardContext, ameiResolveBooking, ameiCpfForContext, ameiPrepareBooking, ameiBook, type BookingPlan, ameiStatus, ameiFreeSlots, ameiPatientAppointments, ameiAppointmentContext, ameiApplyOutcome, ameiMissedContext, ameiWaitlistContext, ameiAddToWaitlist, ameiConfirmList, missedSituationOf, startAmeiWarming, spokenLongDay, spokenClock, spokenMoney, AmeiError, type AppointmentContext, type ConfirmFilters } from './amei.js';
+import { getCampaignSearch, ameiCardContext, ameiResolveBooking, ameiCpfForContext, ameiPrepareBooking, ameiBook, type BookingPlan, ameiStatus, ameiFreeSlots, ameiPatientAppointments, ameiAppointmentContext, ameiApplyOutcome, ameiMissedContext, ameiWaitlistContext, ameiAddToWaitlist, ameiConfirmList, missedSituationOf, startAmeiWarming, spokenLongDay, spokenClock, spokenMoney, titleCase, AmeiError, type AppointmentContext, type ConfirmFilters } from './amei.js';
 import type { Call, CallResult, CallStatus } from './types.js';
 import { SELF_TALK_PATTERNS } from './self-talk-patterns.js';
 
@@ -78,9 +78,11 @@ export function normalizePhone(value: string): string {
   if (!phone?.isValid() || phone.country !== 'BR') throw new PublicError(400,'Número inválido. Informe um celular brasileiro com DDD.');
   return phone.number;
 }
-export async function startCall(brainId: string, patientName: string, rawPhone: string, contactContext: 'not_informed' | 'recent_card_member' | 'appointment_confirmation' | 'missed_appointment' | 'waitlist_capture' | 'card_pitch' = 'not_informed', appointment?: AppointmentContext): Promise<Call> {
+export async function startCall(brainId: string, patientName: string, rawPhone: string, contactContext: 'not_informed' | 'recent_card_member' | 'reactivation_card_member' | 'appointment_confirmation' | 'missed_appointment' | 'waitlist_capture' | 'card_pitch' = 'not_informed', appointment?: AppointmentContext): Promise<Call> {
   if (!brainId || !patientName?.trim() || patientName.length > 120 || !rawPhone) throw new PublicError(400,'Informe cérebro, nome e telefone válidos.');
-  if (!['not_informed','recent_card_member','appointment_confirmation','missed_appointment','waitlist_capture','card_pitch'].includes(contactContext)) throw new PublicError(400,'Origem do contato inválida.');
+  if (!['not_informed','recent_card_member','reactivation_card_member','appointment_confirmation','missed_appointment','waitlist_capture','card_pitch'].includes(contactContext)) throw new PublicError(400,'Origem do contato inválida.');
+  // Nome digitado/colado (ex.: direto de uma planilha em CAIXA ALTA) sai normalizado, pra TTS falar natural.
+  patientName = titleCase(patientName.trim());
   const phone = normalizePhone(rawPhone);
   await ensureElevenLabsCredits();
   const brain = await repo.getBrain(brainId);
@@ -93,6 +95,14 @@ export async function startCall(brainId: string, patientName: string, rawPhone: 
   await repo.importContacts([{ name: patientName.trim(), phone, source: 'ligacao' }]).catch((e: unknown) => console.error('[CONTATOS]', e instanceof Error ? e.message : e));
   const whatsappModels = await whatsappModelsText();
   const ameiAvailable = await ameiAgendaText();
+  // Reativação (Cartão de TODOS, base antiga): contato sem consulta associada na AMEI, então monta um
+  // contexto leve só pra reaproveitar o roteiro/ferramentas de 'reactivation' (sem appointmentId real).
+  const cardSince = contactContext === 'reactivation_card_member'
+    ? /cart[aã]o de todos desde\s+((?:19|20)\d{2})/i.exec((await repo.findContactByPhone(phone).catch(() => null))?.notes ?? '')?.[1]
+    : undefined;
+  const effectiveAppointment: AppointmentContext | undefined = appointment ?? (contactContext === 'reactivation_card_member'
+    ? { appointmentId: '', date: '', time: '', patientName: patientName.trim(), phone, professional: '', specialty: 'Clínico Geral', statusId: 0, kind: 'reactivation', valor: cardSince }
+    : undefined);
   // Captação: deixa pronta a agenda das especialidades mais procuradas, para a resposta sair na hora.
   const stopWarming = (!appointment || appointment.kind === 'missed') && !appointment?.test && ameiAvailable === 'conectada' ? startAmeiWarming() : () => undefined;
   // Faltoso: já deixa pronta a agenda da especialidade (e do profissional) da consulta perdida.
@@ -102,8 +112,8 @@ export async function startCall(brainId: string, patientName: string, rawPhone: 
   try {
     await startCvortexCall({
       callId:call.id, phone, patientName:patientName.trim(), contactContext, agentId, whatsappModels, ameiAgenda: ameiAvailable, extraVariables: appointment ? appointmentVariables(appointment) : undefined,
-      promptOverride: appointment ? promptFor(appointment) : buildAcquisitionPrompt({ patientName: patientName.trim(), greeting: greetingForNow() }),
-      firstMessageOverride: appointment ? firstMessageFor(appointment) : acquisitionFirstMessage(greetingForNow(), patientName.trim()),
+      promptOverride: effectiveAppointment ? promptFor(effectiveAppointment) : buildAcquisitionPrompt({ patientName: patientName.trim(), greeting: greetingForNow() }),
+      firstMessageOverride: effectiveAppointment ? firstMessageFor(effectiveAppointment) : acquisitionFirstMessage(greetingForNow(), patientName.trim()),
       onStatus:(status)=>{ void updateStatus(call,status).catch(error=>console.error('[CALL] status callback failed',error)); },
       onAgentConnected:()=>{ void getManagedCall(call.id).then(current=>current && !current.metadata?.human_takeover ? updateManagedCall(current,{metadata:{...(current.metadata||{}),ai_connected:true}}) : null).then(updated=>{if(updated)publish(updated);}).catch(error=>console.error('[CALL] agent callback failed',error)); },
       onConversationId:(id)=>{ void getManagedCall(call.id).then(current=>current && updateManagedCall(current,{elevenlabs_conversation_id:id})).then(updated=>{if(updated)publish(updated);}).catch(error=>console.error('[CALL] conversation callback failed',error)); },
@@ -111,7 +121,7 @@ export async function startCall(brainId: string, patientName: string, rawPhone: 
       onAudio:(source,pcm)=>publishLive(call.id,{kind:'audio',source,pcm}),
       onText:(role,text,correction)=>{ const clean=text.replace(/\[[^\]]{1,40}\]/g,'').replace(/\s{2,}/g,' ').trim(); if(clean) publishLive(call.id,{kind:'text',role,text:clean,correction}); },
       onFlush:()=>publishLive(call.id,{kind:'flush'}),
-      onToolCall:(name,params)=>handleAgentTool(call.id,phone,call.patientName,name,params,appointment),
+      onToolCall:(name,params)=>handleAgentTool(call.id,phone,call.patientName,name,params,effectiveAppointment),
     });
   }
   catch(error) {
@@ -122,7 +132,8 @@ export async function startCall(brainId: string, patientName: string, rawPhone: 
       throw new PublicError(503,'A discagem pode ter sido aceita. Confira o webphone antes de tentar novamente.');
     }
     call = await updateStatus(call,'failed');
-    throw new PublicError(502,'Não foi possível iniciar a ligação pelo webphone cVortex.');
+    const reason = error instanceof Error && error.message ? error.message : null;
+    throw new PublicError(502,reason ? `Não foi possível iniciar a ligação pelo webphone cVortex (${reason}).` : 'Não foi possível iniciar a ligação pelo webphone cVortex.');
   }
   const current = await getManagedCall(call.id) || call;
   publish(current); void repo.appendEvent(call.id,'call.started',{provider:'cvortex'});
@@ -507,7 +518,7 @@ export function autoConfirmStatus(): AutoConfirmStatus {
 }
 
 export function startAutoConfirm(brainId: string, filters: ConfirmFilters, startFrom?: AutoConfirmStartFrom): void {
-  if (autoConfirm?.active || captacaoAuto?.active) throw new PublicError(409, 'A esteira já está ligando sozinha.');
+  if (autoConfirm?.active || captacaoAuto?.active || reactivationAuto?.active) throw new PublicError(409, 'A esteira já está ligando sozinha.');
   if (!brainId) throw new PublicError(400, 'Selecione um cérebro.');
   autoConfirm = { active: true, brainId, filters: { ...filters, statusId: 2 }, startFrom: startFrom ?? null, attempted: new Set(), current: null, currentCallId: null, remaining: 0, calledCount: 0, lastError: null, startedAt: new Date().toISOString() };
   void runAutoConfirm(autoConfirm);
@@ -655,6 +666,7 @@ function bookableText(a: AppointmentContext): string | undefined {
 function promptFor(a: AppointmentContext): string {
   if (a.kind === 'card') { const v = appointmentVariables(a); const ref = cardReferencePrice(a.specialty); const paidNumber = Number(a.valor); return buildCardPitchPrompt({ patientName: v.patient_name!, day: v.consulta_dia!, time: v.consulta_hora!, professional: v.consulta_profissional!, specialty: v.consulta_especialidade!, paid: spokenMoney(a.valor ?? '') || 'o valor particular', cardPrice: ref ? spokenMoney(String(ref)) : '', saving: ref != null && Number.isFinite(paidNumber) && paidNumber > ref, greeting: greetingForNow() }); }
   if (a.kind === 'waitlist') return buildWaitlistPrompt({ patientName: a.patientName, specialty: a.specialty, professional: a.professional || undefined, greeting: greetingForNow(), bookable: bookableText(a) });
+  if (a.kind === 'reactivation') return buildReactivationPrompt({ patientName: a.patientName, greeting: greetingForNow(), cardSince: a.valor || undefined, bookable: bookableText(a) });
   if (a.kind !== 'missed') return confirmationPromptFor(a);
   const v = appointmentVariables(a);
   return buildMissedPrompt({ patientName: v.patient_name!, day: v.consulta_dia!, time: v.consulta_hora!, professional: v.consulta_profissional!, specialty: v.consulta_especialidade!, situation: missedSituationOf(a.statusId), greeting: greetingForNow(), recoveryStatus: a.recovery?.status, recoveryNext: a.recovery?.next, bookable: bookableText(a) });
@@ -662,6 +674,7 @@ function promptFor(a: AppointmentContext): string {
 function firstMessageFor(a: AppointmentContext): string {
   if (a.kind === 'card') return cardPitchFirstMessage(greetingForNow(), a.patientName);
   if (a.kind === 'waitlist') return waitlistFirstMessage(greetingForNow(), a.patientName);
+  if (a.kind === 'reactivation') return reactivationFirstMessage(greetingForNow(), a.patientName);
   const name = appointmentVariables(a).patient_name!;
   return a.kind === 'missed' ? missedFirstMessage(greetingForNow(), name) : confirmationFirstMessage(greetingForNow(), name);
 }
@@ -765,7 +778,7 @@ const MISSED_OUTCOMES = ['remarcar_horario', 'lista_espera', 'sem_interesse', 'o
 
 /** Ferramenta registrar_faltoso: só mexe na consulta perdida DESTA ligação. A única escrita na AMEI é a lista de espera. */
 async function registerMissed(callId: string, phone: string, appointment: AppointmentContext | undefined, params: Record<string, unknown>): Promise<string> {
-  if (!appointment || (appointment.kind !== 'missed' && appointment.kind !== 'waitlist' && appointment.kind !== 'card')) return 'Esta ligação não é de recuperação de consulta perdida, de lista de espera nem do Cartão de TODOS; não use esta ferramenta.';
+  if (!appointment || (appointment.kind !== 'missed' && appointment.kind !== 'waitlist' && appointment.kind !== 'card' && appointment.kind !== 'reactivation')) return 'Esta ligação não é de recuperação de consulta perdida, de lista de espera nem do Cartão de TODOS; não use esta ferramenta.';
   const outcome = cleanToolText(params.resultado, 24)?.toLowerCase() ?? '';
   if (!MISSED_OUTCOMES.includes(outcome)) return 'Informe o resultado: remarcar_horario, lista_espera, sem_interesse ou outro_interesse.';
   const reason = cleanToolText(params.motivo_falta, 160);
@@ -894,7 +907,7 @@ export function captacaoAutoStatus(): CaptacaoAutoStatus {
   return { active, current, currentCallId, remaining, calledCount, lastError, startedAt };
 }
 export function startCaptacaoAuto(brainId: string, jobId: string, startFrom?: { id: string; direction: 'up' | 'down' }): void {
-  if (captacaoAuto?.active || autoConfirm?.active) throw new PublicError(409, 'A esteira já está ligando sozinha.');
+  if (captacaoAuto?.active || autoConfirm?.active || reactivationAuto?.active) throw new PublicError(409, 'A esteira já está ligando sozinha.');
   if (!brainId) throw new PublicError(400, 'Selecione um cérebro.');
   let rows;
   try { rows = getCampaignSearch(jobId).results; }
@@ -925,6 +938,78 @@ async function runCaptacaoAuto(state: CaptacaoAutoState): Promise<void> {
     await new Promise(resolve => setTimeout(resolve, state.lastError ? ESTEIRA_PAUSE_AFTER_ERROR_MS : ESTEIRA_PAUSE_MS));
   }
   state.active = false; state.current = null; state.currentCallId = null;
+}
+
+// ─── Esteira de Reativação: liga um filiado antigo do Cartão de TODOS atrás do outro ────────────
+const MAX_REACTIVATION_ATTEMPTS = 5;
+export interface ReactivationAutoStatus { active: boolean; current: string | null; currentCallId: string | null; remaining: number; calledCount: number; lastError: string | null; startedAt: string | null }
+interface ReactivationAutoState extends ReactivationAutoStatus { brainId: string; maxAttempts: number; queue: Array<{ id: string; name: string; phone: string }>; }
+let reactivationAuto: ReactivationAutoState | null = null;
+export function reactivationAutoStatus(): ReactivationAutoStatus {
+  if (!reactivationAuto) return { active: false, current: null, currentCallId: null, remaining: 0, calledCount: 0, lastError: null, startedAt: null };
+  const { active, current, currentCallId, remaining, calledCount, lastError, startedAt } = reactivationAuto;
+  return { active, current, currentCallId, remaining, calledCount, lastError, startedAt };
+}
+export async function startReactivationAuto(brainId: string, maxAttempts = 1, startFrom?: { contactId: string; direction: 'up' | 'down' }): Promise<void> {
+  if (reactivationAuto?.active || captacaoAuto?.active || autoConfirm?.active) throw new PublicError(409, 'A esteira já está ligando sozinha.');
+  if (!brainId) throw new PublicError(400, 'Selecione um cérebro.');
+  if (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > MAX_REACTIVATION_ATTEMPTS) throw new PublicError(400, `Escolha entre 1 e ${MAX_REACTIVATION_ATTEMPTS} tentativas por paciente.`);
+  let contacts = (await repo.listContacts()).filter(c => c.source === 'cartao_de_todos' && !c.doNotContact);
+  // Mesma ordem da lista: "a partir daqui pra baixo" segue a ordem a partir do escolhido; "pra cima" começa nele e sobe.
+  if (startFrom) {
+    const anchor = contacts.findIndex(c => c.id === startFrom.contactId);
+    if (anchor >= 0) contacts = startFrom.direction === 'up' ? contacts.slice(0, anchor + 1).reverse() : contacts.slice(anchor);
+  }
+  const queue = contacts.filter(c => c.phone.length >= 10).map(c => ({ id: c.id, name: c.name, phone: c.phone }));
+  if (!queue.length) throw new PublicError(409, 'Nenhum paciente na lista para ligar.');
+  reactivationAuto = { active: true, brainId, maxAttempts, queue, current: null, currentCallId: null, remaining: queue.length, calledCount: 0, lastError: null, startedAt: new Date().toISOString() };
+  void runReactivationAuto(reactivationAuto);
+}
+export function stopReactivationAuto(): void { if (reactivationAuto) reactivationAuto.active = false; }
+async function runReactivationAuto(state: ReactivationAutoState): Promise<void> {
+  while (state.active && state.queue.length) {
+    const next = state.queue[0]!;
+    state.current = next.id;
+    let answered = false;
+    for (let attempt = 1; attempt <= state.maxAttempts && state.active; attempt++) {
+      try {
+        const call = await startCall(state.brainId, next.name, next.phone, 'reactivation_card_member');
+        state.currentCallId = call.id; state.calledCount++; state.lastError = null;
+        await waitForCallId(call.id);
+        answered = Boolean((await getManagedCall(call.id))?.answeredAt);
+      } catch (error) { state.lastError = error instanceof Error ? error.message : 'Não foi possível ligar.'; }
+      state.currentCallId = null;
+      if (answered || !state.active || attempt >= state.maxAttempts) break;
+      await new Promise(resolve => setTimeout(resolve, state.lastError ? ESTEIRA_PAUSE_AFTER_ERROR_MS : ESTEIRA_PAUSE_MS));
+    }
+    state.queue.shift();
+    state.remaining = state.queue.length;
+    state.current = null;
+    if (!state.active) break;
+    await new Promise(resolve => setTimeout(resolve, state.lastError ? ESTEIRA_PAUSE_AFTER_ERROR_MS : ESTEIRA_PAUSE_MS));
+  }
+  state.active = false; state.current = null; state.currentCallId = null;
+}
+
+// ─── Resumo da campanha de reativação: funil de resultado das ligações já feitas ────────────────
+export interface ReactivationSummary { total: number; notCalledYet: number; called: number; answered: number; noAnswer: number; voicemail: number; interested: number; notInterested: number; unclassified: number }
+export async function reactivationSummary(): Promise<ReactivationSummary> {
+  const contacts = (await repo.listContacts()).filter(c => c.source === 'cartao_de_todos');
+  const byPhone = await repo.reactivationCallsByPhone();
+  let called = 0, answered = 0, noAnswer = 0, voicemail = 0, interested = 0, notInterested = 0, unclassified = 0;
+  for (const c of contacts) {
+    const info = byPhone.get(c.phone);
+    if (!info) continue;
+    called++;
+    if (info.status === 'in_progress' || info.status === 'completed') {
+      answered++;
+      if (info.result === 'interested') interested++;
+      else if (info.result === 'not_interested') notInterested++;
+      else unclassified++;
+    } else if (info.status === 'voicemail') voicemail++;
+    else noAnswer++;
+  }
+  return { total: contacts.length, notCalledYet: contacts.length - called, called, answered, noAnswer, voicemail, interested, notInterested, unclassified };
 }
 
 

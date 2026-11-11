@@ -10,9 +10,9 @@ import * as repo from './repository.js';
 import { CallEventsService } from './monitor.js';
 import { cvortexConnectionStatus, cvortexReady, openCvortexBrowser } from './cvortex-provider.js';
 import { openWhatsapp, whatsappStatus } from './whatsapp.js';
-import { ameiStatus, ameiApplyOutcome, openAmei, ameiConfirmList, ameiConfirmOptions, ameiProfessionalsOf, ameiRecoveryStatusOf, startCampaignSearch, getCampaignSearch, type CampaignMode, type MissedSituations, AmeiError } from './amei.js';
+import { ameiStatus, ameiApplyOutcome, openAmei, ameiConfirmList, ameiConfirmOptions, ameiProfessionalsOf, ameiRecoveryStatusOf, startCampaignSearch, getCampaignSearch, titleCase, type CampaignMode, type MissedSituations, AmeiError } from './amei.js';
 import { connectElevenLabs, connectionDetails, disconnectElevenLabs } from './connections.js';
-import { PublicError, startWhatsappReplyWatcher, startConfirmationCall, startTestConfirmationCall, startMissedCall, startWaitlistCall, startCardCall, startTestMissedCall, startTestWaitlistCall, startAutoConfirm, startCaptacaoAuto, decideBooking, stopCaptacaoAuto, captacaoAutoStatus, stopAutoConfirm, autoConfirmStatus, normalizePhone, sendTestWhatsapp, endCall, getCallAudio, getCallTranscript, getManagedCall, getManagedCallByConversationId, listManagedCalls, markCallAnswered, markCallVoicemail, saveResult, startCall, syncCall, takeoverCall, updateStatus } from './services.js';
+import { PublicError, startWhatsappReplyWatcher, startConfirmationCall, startTestConfirmationCall, startMissedCall, startWaitlistCall, startCardCall, startTestMissedCall, startTestWaitlistCall, startAutoConfirm, startCaptacaoAuto, decideBooking, stopCaptacaoAuto, captacaoAutoStatus, stopAutoConfirm, autoConfirmStatus, startReactivationAuto, stopReactivationAuto, reactivationAutoStatus, reactivationSummary, normalizePhone, sendTestWhatsapp, endCall, getCallAudio, getCallTranscript, getManagedCall, getManagedCallByConversationId, listManagedCalls, markCallAnswered, markCallVoicemail, saveResult, startCall, syncCall, takeoverCall, updateStatus } from './services.js';
 import type { CallResult, ContactSource } from './types.js';
 
 const app=express();
@@ -65,19 +65,26 @@ app.post('/api/webhooks/elevenlabs',express.raw({type:'application/json',limit:'
 
 app.use('/api',requireSession);
 app.post('/api/contacts/import',express.json({limit:'2mb'}),wrap(async(req,res)=>{
-  const {rows}=req.body as {rows?:unknown};
+  const {rows,source,cardSince}=req.body as {rows?:unknown;source?:unknown;cardSince?:unknown};
   if(!Array.isArray(rows)||rows.length===0||rows.length>5000)throw new PublicError(400,'Envie de 1 a 5000 linhas.');
-  const valid=new Map<string,{name:string;phone:string;source:ContactSource}>();const invalid:{line:number;reason:string}[]=[];
+  const importSource=cleanSource(source,'planilha');
+  if(cardSince!==undefined&&cardSince!==null&&cardSince!==''&&!(typeof cardSince==='string'&&/^(19|20)\d{2}$/.test(cardSince)))throw new PublicError(400,'Ano de filiação inválido.');
+  // Base do Cartão de TODOS: o ano de filiação vai na observação do contato e a Giovana usa na fala ("desde 2021").
+  const notes=importSource==='cartao_de_todos'&&typeof cardSince==='string'&&cardSince?`Cartão de TODOS desde ${cardSince}`:null;
+  const valid=new Map<string,{name:string;phone:string;source:ContactSource;notes:string|null}>();const invalid:{line:number;reason:string}[]=[];
   rows.forEach((row:unknown,index:number)=>{
     const r=row as {name?:unknown;phone?:unknown};
-    try{if(typeof r?.phone!=='string')throw new Error('sem telefone');const phone=normalizePhone(r.phone);const name=typeof r.name==='string'&&r.name.trim()?cleanName(r.name):'Sem nome';valid.set(phone,{name,phone,source:'planilha'});}
+    // Planilhas costumam vir em MAIÚSCULO; em caixa normal a TTS lê o nome com naturalidade.
+    try{if(typeof r?.phone!=='string')throw new Error('sem telefone');const phone=normalizePhone(r.phone);const name=typeof r.name==='string'&&r.name.trim()?titleCase(cleanName(r.name)):'Sem nome';valid.set(phone,{name,phone,source:importSource,notes});}
     catch{invalid.push({line:index+1,reason:'telefone ou nome inválido'});}
   });
   const imported=await repo.importContacts([...valid.values()]);
   res.json({imported,duplicates:valid.size-imported,invalid:invalid.slice(0,50),invalidCount:invalid.length});
 }));
 app.use('/api',express.json({limit:'64kb'}));
-app.use('/api',rateLimit({windowMs:60*1000,limit:120,standardHeaders:'draft-7',legacyHeaders:false}));
+// Várias telas do painel ficam montadas em paralelo (só escondidas com display:none) e cada uma tem seu próprio
+// polling de status (3-5s); 120/min já não dava conta antes do Cartão de TODOS, e dá menos ainda agora.
+app.use('/api',rateLimit({windowMs:60*1000,limit:600,standardHeaders:'draft-7',legacyHeaders:false}));
 app.get('/api/connections',wrap(async(_req,res)=>{res.json(await connectionDetails());}));
 app.post('/api/connections/cvortex/open',wrap(async(_req,res)=>{await openCvortexBrowser();res.json({opening:true});}));
 app.put('/api/connections/elevenlabs',wrap(async(req,res)=>{
@@ -212,6 +219,16 @@ app.post('/api/amei/captacao/auto/start',wrap(async(req,res)=>{
 app.post('/api/amei/captacao/auto/stop',wrap(async(_req,res)=>{stopCaptacaoAuto();res.json(captacaoAutoStatus());}));
 app.get('/api/amei/captacao/auto/status',wrap(async(_req,res)=>{res.json(captacaoAutoStatus());}));
 app.post('/api/amei/confirm/auto/stop',wrap(async(_req,res)=>{stopAutoConfirm();res.json(autoConfirmStatus());}));
+app.post('/api/reactivation/auto/start',wrap(async(req,res)=>{
+  const b=req.body as {brainId?:string;maxAttempts?:number;startFromContactId?:string;startFromDirection?:'up'|'down'};
+  if(!b.brainId)throw new PublicError(400,'Informe o cérebro.');
+  const startFrom=b.startFromContactId&&(b.startFromDirection==='up'||b.startFromDirection==='down')?{contactId:b.startFromContactId,direction:b.startFromDirection}:undefined;
+  await startReactivationAuto(b.brainId,Number.isFinite(b.maxAttempts)?Number(b.maxAttempts):1,startFrom);
+  res.status(201).json(reactivationAutoStatus());
+}));
+app.post('/api/reactivation/auto/stop',wrap(async(_req,res)=>{stopReactivationAuto();res.json(reactivationAutoStatus());}));
+app.get('/api/reactivation/auto/status',wrap(async(_req,res)=>{res.json(reactivationAutoStatus());}));
+app.get('/api/reactivation/summary',wrap(async(_req,res)=>{res.json(await reactivationSummary());}));
 app.get('/api/amei/confirm/auto/status',wrap(async(_req,res)=>{res.json(autoConfirmStatus());}));
 app.post('/api/amei/missed/call',wrap(async(req,res)=>{
   const {brainId,appointmentId}=req.body as {brainId?:string;appointmentId?:string};
@@ -246,9 +263,9 @@ app.post('/api/whatsapp/test',wrap(async(req,res)=>{
 }));
 app.get('/api/calls',wrap(async(_req,res)=>{res.json({calls:await listManagedCalls()});}));
 app.post('/api/calls',wrap(async(req,res)=>{
-  const {brainId,patientName,phone,contactContext='not_informed'}=req.body as {brainId?:string;patientName?:string;phone?:string;contactContext?:'not_informed'|'recent_card_member'};
+  const {brainId,patientName,phone,contactContext='not_informed'}=req.body as {brainId?:string;patientName?:string;phone?:string;contactContext?:'not_informed'|'recent_card_member'|'reactivation_card_member'};
   if(typeof brainId!=='string'||typeof patientName!=='string'||typeof phone!=='string')throw new PublicError(400,'Informe cérebro, nome e telefone.');
-  if(contactContext!=='not_informed'&&contactContext!=='recent_card_member')throw new PublicError(400,'Origem do contato inválida. Confirmações de consulta são feitas pela tela Confirmar agenda.');
+  if(contactContext!=='not_informed'&&contactContext!=='recent_card_member'&&contactContext!=='reactivation_card_member')throw new PublicError(400,'Origem do contato inválida. Confirmações de consulta são feitas pela tela Confirmar agenda.');
   const call=await startCall(brainId,patientName,phone,contactContext);res.status(201).json({success:true,call});
 }));
 app.get('/api/calls/:id',wrap(async(req,res)=>{res.json({call:await syncCall(requireCall(await getManagedCall(idParam(req))))});}));

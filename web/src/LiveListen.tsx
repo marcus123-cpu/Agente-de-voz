@@ -4,9 +4,13 @@ import { apiBase } from './api'
 
 type Line = { id: number; role: 'patient' | 'agent'; text: string }
 type Phase = 'idle' | 'connecting' | 'on'
+type ScheduledEntry = { node: AudioBufferSourceNode; nodeGain: GainNode; source: 'patient' | 'agent' }
 
 const SAMPLE_RATE = 16000
 const MAX_LINES = 60
+// Fade rápido usado para encerrar nodes de forma suave (underrun, flush, stop manual) em vez de um
+// node.stop() seco, que causa estalo audível quando a amplitude não está perto de zero.
+const FAST_FADE_SECONDS = 0.015
 
 function listenUrl(callId: string) {
   const base = apiBase || window.location.origin
@@ -27,25 +31,53 @@ export function LiveListen({ callId, active, humanTakeover, compact = false }: {
   const ctxRef = useRef<AudioContext | null>(null)
   const gainRef = useRef<GainNode | null>(null)
   const nextRef = useRef<{ patient: number; agent: number }>({ patient: 0, agent: 0 })
-  const agentNodes = useRef<Set<AudioBufferSourceNode>>(new Set())
+  const scheduledNodes = useRef<Set<ScheduledEntry>>(new Set())
   const levelRef = useRef({ patient: 0, agent: 0 })
   const lineId = useRef(0)
   const transcriptRef = useRef<HTMLDivElement | null>(null)
+  // Distingue fechamento manual (usuário clicou "Parar de ouvir" / trocou de ligação) de fechamento
+  // inesperado do WebSocket, pra só reconectar automaticamente neste último caso.
+  const manualStopRef = useRef(false)
+  const retryTimerRef = useRef<number | null>(null)
+  const activeRef = useRef(active)
+  useEffect(() => { activeRef.current = active }, [active])
 
-  const stop = useCallback(() => {
+  // Limpeza pura: fecha ws/ctx, para nodes agendados (com fade rápido pra não estalar) e zera refs.
+  // Não decide se foi parada manual ou não — isso é responsabilidade de quem chama.
+  const cleanup = useCallback(() => {
     const ws = wsRef.current
     wsRef.current = null
-    if (ws) { ws.onclose = null; ws.onmessage = null; try { ws.close() } catch { /* já fechado */ } }
-    for (const node of agentNodes.current) { try { node.stop() } catch { /* já terminou */ } }
-    agentNodes.current.clear()
+    if (ws) { ws.onclose = null; ws.onmessage = null; ws.onerror = null; try { ws.close() } catch { /* já fechado */ } }
     const ctx = ctxRef.current
+    const entries = [...scheduledNodes.current]
+    scheduledNodes.current.clear()
+    for (const entry of entries) {
+      try {
+        if (ctx) {
+          entry.nodeGain.gain.cancelScheduledValues(ctx.currentTime)
+          entry.nodeGain.gain.setValueAtTime(entry.nodeGain.gain.value, ctx.currentTime)
+          entry.nodeGain.gain.linearRampToValueAtTime(0, ctx.currentTime + FAST_FADE_SECONDS)
+          entry.node.stop(ctx.currentTime + FAST_FADE_SECONDS + 0.005)
+        } else {
+          entry.node.stop()
+        }
+      } catch { /* já terminou */ }
+    }
     ctxRef.current = null
     gainRef.current = null
-    if (ctx) void ctx.close().catch(() => undefined)
+    // O fade leva ~20ms: adia o close físico do contexto pra não cortar o fade na mesma tick. Os refs já
+    // foram zerados acima, então uma chamada concorrente de cleanup() não tenta fechar o mesmo ctx de novo.
+    if (ctx) setTimeout(() => { try { void ctx.close().catch(() => undefined) } catch { /* já fechado por outra chamada */ } }, 30)
     levelRef.current = { patient: 0, agent: 0 }
     setLevels({ patient: 0, agent: 0 })
     setPhase('idle')
   }, [])
+
+  const stop = useCallback(() => {
+    manualStopRef.current = true
+    if (retryTimerRef.current !== null) { window.clearTimeout(retryTimerRef.current); retryTimerRef.current = null }
+    cleanup()
+  }, [cleanup])
 
   const playChunk = useCallback((source: 'patient' | 'agent', buffer: ArrayBuffer) => {
     const ctx = ctxRef.current
@@ -59,15 +91,31 @@ export function LiveListen({ callId, active, humanTakeover, compact = false }: {
     levelRef.current[source] = Math.min(1, Math.sqrt(sum / pcm.length) * 4)
     const node = ctx.createBufferSource()
     node.buffer = audio
-    node.connect(gain)
+    const nodeGain = ctx.createGain()
+    node.connect(nodeGain)
+    nodeGain.connect(gain)
     // A Giovana chega mais rápido que tempo real: enfileira para tocar em sequência.
     const start = Math.max(nextRef.current[source], ctx.currentTime + 0.12)
+    // Fade-in/out curto (~3ms, nunca mais que meio buffer) pra disfarçar bordas de underrun/flush/stop.
+    const fade = Math.min(0.003, audio.duration / 2)
+    nodeGain.gain.setValueAtTime(0, start)
+    nodeGain.gain.linearRampToValueAtTime(1, start + fade)
+    nodeGain.gain.setValueAtTime(1, Math.max(start + fade, start + audio.duration - fade))
+    nodeGain.gain.linearRampToValueAtTime(0, start + audio.duration)
     node.start(start)
     nextRef.current[source] = start + audio.duration
-    if (source === 'agent') { agentNodes.current.add(node); node.onended = () => agentNodes.current.delete(node) }
+    const entry: ScheduledEntry = { node, nodeGain, source }
+    scheduledNodes.current.add(entry)
+    node.onended = () => scheduledNodes.current.delete(entry)
   }, [])
 
   const start = useCallback(async () => {
+    // Fecha qualquer sessão anterior antes de abrir uma nova (ex.: callId mudou com o componente ainda
+    // montado): sem isso o WS/AudioContext antigo continua ativo escrevendo nos refs da sessão nova,
+    // misturando áudio de ligações diferentes.
+    if (wsRef.current || ctxRef.current) cleanup()
+    manualStopRef.current = false
+    if (retryTimerRef.current !== null) { window.clearTimeout(retryTimerRef.current); retryTimerRef.current = null }
     setError('')
     setPhase('connecting')
     try {
@@ -84,18 +132,43 @@ export function LiveListen({ callId, active, humanTakeover, compact = false }: {
       wsRef.current = ws
       ws.onopen = () => setPhase('on')
       ws.onerror = () => setError('Não foi possível conectar a escuta. Verifique se a ligação está ativa.')
-      ws.onclose = () => stop()
+      ws.onclose = (event) => {
+        cleanup()
+        // code 1000 = fechamento normal (ex.: o servidor encerra a escuta de propósito quando a
+        // ligação termina, monitor.ts). Só tenta reconectar em queda inesperada (rede, servidor caiu).
+        if (!manualStopRef.current && activeRef.current && event.code !== 1000) {
+          setError('Conexão de escuta caiu — reconectando...')
+          retryTimerRef.current = window.setTimeout(() => {
+            retryTimerRef.current = null
+            if (activeRef.current) void start()
+          }, 1000)
+        }
+      }
       ws.onmessage = (event) => {
         if (event.data instanceof ArrayBuffer) {
           const tag = new Uint8Array(event.data, 0, 1)[0]
+          if (tag !== 1 && tag !== 2) return
           playChunk(tag === 1 ? 'patient' : 'agent', event.data)
           return
         }
         let message: { type?: string; role?: 'patient' | 'agent'; text?: string; correction?: boolean }
         try { message = JSON.parse(String(event.data)) } catch { return }
         if (message.type === 'flush') {
-          for (const node of agentNodes.current) { try { node.stop() } catch { /* já terminou */ } }
-          agentNodes.current.clear()
+          const ctxNow = ctxRef.current
+          const toStop = [...scheduledNodes.current].filter((entry) => entry.source === 'agent')
+          for (const entry of toStop) {
+            try {
+              if (ctxNow) {
+                entry.nodeGain.gain.cancelScheduledValues(ctxNow.currentTime)
+                entry.nodeGain.gain.setValueAtTime(entry.nodeGain.gain.value, ctxNow.currentTime)
+                entry.nodeGain.gain.linearRampToValueAtTime(0, ctxNow.currentTime + FAST_FADE_SECONDS)
+                entry.node.stop(ctxNow.currentTime + FAST_FADE_SECONDS + 0.005)
+              } else {
+                entry.node.stop()
+              }
+            } catch { /* já terminou */ }
+            scheduledNodes.current.delete(entry)
+          }
           nextRef.current.agent = 0
         }
         if (message.type === 'text' && message.role && message.text) {
@@ -113,7 +186,7 @@ export function LiveListen({ callId, active, humanTakeover, compact = false }: {
       setError(cause instanceof Error ? cause.message : 'Não foi possível iniciar a escuta.')
       stop()
     }
-  }, [callId, playChunk, stop, volume])
+  }, [callId, cleanup, playChunk, stop, volume])
 
   useEffect(() => { if (gainRef.current) gainRef.current.gain.value = volume }, [volume])
   useEffect(() => () => stop(), [stop])

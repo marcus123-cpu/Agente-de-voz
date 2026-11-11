@@ -1,3 +1,15 @@
+import * as XLSX from 'xlsx'
+
+/** Lê um arquivo de contatos (CSV/TXT como texto puro, .xlsx/.xls convertido pra CSV primeiro). */
+export async function readContactsFile(file: File): Promise<string> {
+  if (/\.(xlsx|xls)$/i.test(file.name)) {
+    const workbook = XLSX.read(await file.arrayBuffer(), { type: 'array' })
+    const sheet = workbook.Sheets[workbook.SheetNames[0]]
+    return sheet ? XLSX.utils.sheet_to_csv(sheet) : ''
+  }
+  return file.text()
+}
+
 /** Lê CSV/colagem: separa por ; , tab, aceita aspas e descobre as colunas de nome e telefone. */
 export function parseContacts(text: string): { name: string; phone: string }[] {
   const lines = (text.charCodeAt(0) === 0xfeff ? text.slice(1) : text).split(/\r?\n/).map((l) => l.trim()).filter(Boolean)

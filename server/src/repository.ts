@@ -50,8 +50,25 @@ export async function updateContact(id: string, changes: Row): Promise<Contact> 
   return contact(unwrap(data, error));
 }
 export async function deleteContact(id: string): Promise<void> { const { error } = await database().from('contacts').delete().eq('id', id); if (error) throw new Error(error.message); }
+/** Última ligação (por telefone) da campanha de reativação do Cartão de TODOS, pro resumo/funil. */
+export async function reactivationCallsByPhone(): Promise<Map<string, { status: string; result: CallResult | null }>> {
+  const { data, error } = await database().from('calls').select('phone,status,result,metadata,created_at').order('created_at', { ascending: false }).limit(5000);
+  if (error) throw new Error(error.message);
+  const map = new Map<string, { status: string; result: CallResult | null }>();
+  for (const row of data ?? []) {
+    if ((row.metadata as { contact_context?: string } | null)?.contact_context !== 'reactivation_card_member') continue;
+    const phone = String(row.phone);
+    if (!map.has(phone)) map.set(phone, { status: String(row.status), result: (row.result as CallResult | null) ?? null });
+  }
+  return map;
+}
+export async function findContactByPhone(phone: string): Promise<{ name: string; notes: string | null } | null> {
+  const { data, error } = await database().from('contacts').select('name,notes').eq('phone', phone).maybeSingle();
+  if (error) throw new Error(error.message);
+  return data ? { name: String(data.name), notes: (data.notes as string | null) ?? null } : null;
+}
 /** Importa em lote ignorando telefones que já existem. Retorna quantos entraram. */
-export async function importContacts(rows: { name: string; phone: string; source: ContactSource }[]): Promise<number> {
+export async function importContacts(rows: { name: string; phone: string; source: ContactSource; notes?: string | null }[]): Promise<number> {
   if (!rows.length) return 0;
   const { data, error } = await database().from('contacts').upsert(rows, { onConflict: 'phone', ignoreDuplicates: true }).select('id');
   if (error) throw new Error(error.message);

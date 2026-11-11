@@ -1,4 +1,4 @@
-import type { Brain, Call, CallTranscript, ConnectionDetails, Contact, ImportReport, IntegrationStatus, MessageTemplate, Result, WhatsappMessage, WhatsappStatus, AmeiStatus, ConfirmOptions, ConfirmRow, RecoveryInfo, CampaignMode, CampaignJobStatus, AutoConfirmStatus } from './types'
+import type { Brain, Call, CallTranscript, ConnectionDetails, Contact, ImportReport, IntegrationStatus, MessageTemplate, Result, WhatsappMessage, WhatsappStatus, AmeiStatus, ConfirmOptions, ConfirmRow, RecoveryInfo, CampaignMode, CampaignJobStatus, AutoConfirmStatus, ReactivationSummary } from './types'
 
 export const apiBase = import.meta.env.VITE_API_BASE_URL || ''
 
@@ -26,7 +26,7 @@ export const api = {
     const value = await request<Call | { call: Call }>(`/api/calls/${id}`)
     return 'call' in value ? value.call : value
   },
-  startCall: async (brainId: string, patientName: string, phone: string, contactContext: 'not_informed' | 'recent_card_member') => {
+  startCall: async (brainId: string, patientName: string, phone: string, contactContext: 'not_informed' | 'recent_card_member' | 'reactivation_card_member') => {
     const value = await request<{ success: true; call: Call } | Call>('/api/calls', { method: 'POST', body: JSON.stringify({ brainId, patientName, phone, contactContext }) })
     return 'call' in value ? value.call : value
   },
@@ -46,7 +46,7 @@ export const api = {
   createContact: async (values: { name: string; phone: string; notes: string | null }) => (await request<{ contact: Contact }>('/api/contacts', { method: 'POST', body: JSON.stringify(values) })).contact,
   updateContact: async (id: string, patch: { name?: string; phone?: string; notes?: string | null; doNotContact?: boolean }) => (await request<{ contact: Contact }>(`/api/contacts/${id}`, { method: 'PATCH', body: JSON.stringify(patch) })).contact,
   deleteContact: (id: string) => request<unknown>(`/api/contacts/${id}`, { method: 'DELETE' }),
-  importContacts: (rows: { name: string; phone: string }[]) => request<ImportReport>('/api/contacts/import', { method: 'POST', body: JSON.stringify({ rows }) }),
+  importContacts: (rows: { name: string; phone: string }[], source?: 'planilha' | 'cartao_de_todos', cardSince?: string) => request<ImportReport>('/api/contacts/import', { method: 'POST', body: JSON.stringify({ rows, source, cardSince: cardSince || undefined }) }),
   templates: async () => (await request<{ templates: MessageTemplate[] }>('/api/automations/templates')).templates,
   createTemplate: async (values: { name: string; whenToUse: string; body: string; isActive: boolean }) => (await request<{ template: MessageTemplate }>('/api/automations/templates', { method: 'POST', body: JSON.stringify(values) })).template,
   updateTemplate: async (id: string, patch: { name?: string; whenToUse?: string; body?: string; isActive?: boolean }) => (await request<{ template: MessageTemplate }>(`/api/automations/templates/${id}`, { method: 'PATCH', body: JSON.stringify(patch) })).template,
@@ -74,6 +74,10 @@ export const api = {
   startCaptacaoAuto: (body: { brainId: string; jobId: string; startFromId?: string; startFromDirection?: 'up' | 'down' }) => request<AutoConfirmStatus>('/api/amei/captacao/auto/start', { method: 'POST', body: JSON.stringify(body) }),
   stopCaptacaoAuto: () => request<AutoConfirmStatus>('/api/amei/captacao/auto/stop', { method: 'POST' }),
   captacaoAutoStatus: () => request<AutoConfirmStatus>('/api/amei/captacao/auto/status'),
+  startReactivationAuto: (body: { brainId: string; maxAttempts?: number; startFromContactId?: string; startFromDirection?: 'up' | 'down' }) => request<AutoConfirmStatus>('/api/reactivation/auto/start', { method: 'POST', body: JSON.stringify(body) }),
+  stopReactivationAuto: () => request<AutoConfirmStatus>('/api/reactivation/auto/stop', { method: 'POST' }),
+  reactivationAutoStatus: () => request<AutoConfirmStatus>('/api/reactivation/auto/status'),
+  reactivationSummary: () => request<ReactivationSummary>('/api/reactivation/summary'),
   startCampaignSearch: (filters: { mode: CampaignMode; specialtyId: string; professionalId?: string; monthFrom?: string; monthTo?: string; dateFrom?: string; dateTo?: string; situations?: 'faltou_desmarcou' | 'faltou' | 'desmarcou'; cardFilter?: 'todos' | 'sem_cartao' }) => request<{ jobId: string }>('/api/amei/captacao/search', { method: 'POST', body: JSON.stringify(filters) }),
   campaignSearchStatus: (jobId: string) => request<CampaignJobStatus>(`/api/amei/captacao/search/${jobId}`),
   ameiStatus: () => request<AmeiStatus>('/api/amei/status'),

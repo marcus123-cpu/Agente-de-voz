@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react'
-import { CheckCircle2, Hand, PhoneCall, PhoneOff, RotateCcw, X, XCircle } from 'lucide-react'
+import { CheckCircle2, Hand, PhoneCall, PhoneOff, Redo2, RotateCcw, X, XCircle } from 'lucide-react'
 import type { Call, CallStatus } from './types'
 import { LiveListen } from './LiveListen'
 import { api } from './api'
@@ -56,7 +56,7 @@ function clock(seconds: number) { const s = Math.max(0, seconds); return `${Stri
 function maskPhone(phone: string) { const d = phone.replace(/\D/g, '').replace(/^55/, ''); return d.length >= 10 ? `(${d.slice(0, 2)}) ${d.slice(2, d.length - 4)}-${d.slice(-4)}` : phone }
 
 /** Mini painel flutuante: mostra se a ligação está chamando e se a consulta foi confirmada, sem precisar ouvir. */
-export function CallWidget({ call, elapsed, demo, ending, takingOver, markingAnswered, markingVoicemail, onTakeover, onEnd, onMarkAnswered, onMarkVoicemail, onOpen, onClose, onRefresh }: { call: Call; elapsed: number; demo: boolean; ending: boolean; takingOver: boolean; markingAnswered: boolean; markingVoicemail: boolean; onTakeover: () => void; onEnd: () => void; onMarkAnswered: () => void; onMarkVoicemail: () => void; onOpen: () => void; onClose: () => void; onRefresh: () => void }) {
+export function CallWidget({ call, elapsed, demo, ending, takingOver, markingAnswered, markingVoicemail, redialing, onTakeover, onEnd, onMarkAnswered, onMarkVoicemail, onRedial, onOpen, onClose, onRefresh }: { call: Call; elapsed: number; demo: boolean; ending: boolean; takingOver: boolean; markingAnswered: boolean; markingVoicemail: boolean; redialing?: boolean; onTakeover: () => void; onEnd: () => void; onMarkAnswered: () => void; onMarkVoicemail: () => void; onRedial?: () => void; onOpen: () => void; onClose: () => void; onRefresh: () => void }) {
   const done = finished.includes(call.status)
   const drag = useDraggableWidget()
   // Depois que a ligação acaba, relê mais duas vezes para pegar o resultado gravado no final.
@@ -72,15 +72,17 @@ export function CallWidget({ call, elapsed, demo, ending, takingOver, markingAns
   const isMissed = appointment?.kind === 'missed'
   const human = Boolean(call.metadata?.human_takeover)
   const talking = call.status === 'in_progress'
-  // Atalhos no teclado numérico: 0 = Assumir, 1 = Ouvir (no LiveListen), 2 = Encerrar, 3 = Caixa postal (só com ligação em andamento e fora de campos de texto).
-  const shortcuts = useRef({ done, talking, human, ending, takingOver, markingAnswered, markingVoicemail, onTakeover, onEnd, onMarkAnswered, onMarkVoicemail })
-  shortcuts.current = { done, talking, human, ending, takingOver, markingAnswered, markingVoicemail, onTakeover, onEnd, onMarkAnswered, onMarkVoicemail }
+  // Atalhos no teclado numérico: 0 = Assumir, 1 = Ouvir (no LiveListen), 2 = Encerrar, 3 = Caixa postal, + = Ligar novamente (só com ligação em andamento/encerrada conforme o caso, e fora de campos de texto).
+  const shortcuts = useRef({ done, talking, human, ending, takingOver, markingAnswered, markingVoicemail, redialing, onTakeover, onEnd, onMarkAnswered, onMarkVoicemail, onRedial })
+  shortcuts.current = { done, talking, human, ending, takingOver, markingAnswered, markingVoicemail, redialing, onTakeover, onEnd, onMarkAnswered, onMarkVoicemail, onRedial }
   useEffect(() => {
     function onKey(event: KeyboardEvent) {
       const s = shortcuts.current
-      if (s.done || event.repeat || event.ctrlKey || event.altKey || event.metaKey) return
+      if (event.repeat || event.ctrlKey || event.altKey || event.metaKey) return
       const target = event.target as HTMLElement | null
       if (target && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName))) return
+      if (event.code === 'NumpadAdd') { if (s.done && s.onRedial && !s.redialing) { event.preventDefault(); s.onRedial() } return }
+      if (s.done) return
       if (event.code === 'Numpad0') { if (!s.human && !s.takingOver) { event.preventDefault(); s.onTakeover() } }
       else if (event.code === 'Numpad2') { if (!s.ending) { event.preventDefault(); s.onEnd() } }
       else if (event.code === 'Numpad3') { if (!s.human && !s.markingVoicemail) { event.preventDefault(); s.onMarkVoicemail() } }
@@ -152,11 +154,14 @@ export function CallWidget({ call, elapsed, demo, ending, takingOver, markingAns
       </div>}
     </div>}
     {!done && <div className="cw-actions">
-      {!demo && <LiveListen compact callId={call.id} active={!done} humanTakeover={human}/>}
+      {!demo && <LiveListen key={call.id} compact callId={call.id} active={!done} humanTakeover={human}/>}
       {talking && !human && <button className="cw-act cw-act-take" disabled={markingAnswered} title="Use se perceber que a pessoa atendeu e está falando, mas a Giovana continua muda" onClick={onMarkAnswered}><PhoneCall size={13}/>{markingAnswered ? 'Avisando...' : 'Atendeu'}</button>}
       {!human && <button className="cw-act cw-act-take" disabled={markingVoicemail} title="Use se perceber que caiu na caixa postal/gravação: desliga e já manda o WhatsApp de confirmação" onClick={onMarkVoicemail}><PhoneOff size={13}/>{markingVoicemail ? 'Marcando...' : 'Caixa postal [3]'}</button>}
       <button className="cw-act cw-act-take" disabled={human || takingOver} onClick={onTakeover}><Hand size={13}/>{human ? 'Assumida' : takingOver ? 'Assumindo...' : 'Assumir [0]'}</button>
       <button className="cw-act cw-act-end" disabled={ending} onClick={onEnd}><PhoneOff size={13}/>{ending ? 'Encerrando...' : 'Encerrar [2]'}</button>
+    </div>}
+    {done && onRedial && <div className="cw-actions">
+      <button className="cw-act cw-act-take" disabled={redialing} title={`Ligar de novo para o mesmo número (${maskPhone(call.phone)})`} onClick={onRedial}><Redo2 size={13}/>{redialing ? 'Ligando...' : 'Ligar novamente [+]'}</button>
     </div>}
     <footer><button onClick={onOpen}>Abrir atendimento</button></footer>
   </aside>

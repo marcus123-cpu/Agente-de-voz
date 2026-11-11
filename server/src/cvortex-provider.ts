@@ -29,7 +29,7 @@ export interface CvortexStartOptions {
   callId: string;
   phone: string;
   patientName: string;
-  contactContext: 'not_informed' | 'recent_card_member' | 'appointment_confirmation' | 'missed_appointment' | 'waitlist_capture' | 'card_pitch';
+  contactContext: 'not_informed' | 'recent_card_member' | 'reactivation_card_member' | 'appointment_confirmation' | 'missed_appointment' | 'waitlist_capture' | 'card_pitch';
   agentId: string;
   /** Modelos de WhatsApp que a IA pode enviar (vira a variável {{modelos_whatsapp}} do prompt). */
   whatsappModels?: string;
@@ -142,9 +142,14 @@ function flushPendingPatientAudio(session: Session): void {
   if (!patientAudioReady(session) || !session.pendingPatientAudio.length) return;
   const pending = session.pendingPatientAudio;
   session.pendingPatientAudio = []; session.pendingPatientAudioBytes = 0;
-  for (const chunk of pending) {
+  let index = 0;
+  for (; index < pending.length; index++) {
     if (!patientAudioReady(session) || session.agentSocket!.bufferedAmount >= MAX_BUFFERED) break;
-    session.agentSocket!.send(JSON.stringify({ user_audio_chunk: chunk.toString('base64') }));
+    session.agentSocket!.send(JSON.stringify({ user_audio_chunk: pending[index]!.toString('base64') }));
+  }
+  for (; index < pending.length; index++) {
+    session.pendingPatientAudio.push(pending[index]!);
+    session.pendingPatientAudioBytes += pending[index]!.length;
   }
 }
 function fireStatus(session: Session, status: CallStatus): void { fire(() => session.options.onStatus?.(status)); }
@@ -278,6 +283,9 @@ class CvortexBrowserProvider {
     const item = page.getByText('Ligar para um Colaborador', { exact: true });
     if (await item.isVisible()) return;
     const buttons = page.locator('svg[aria-label="Navigation Menu Vertical"]');
+    // O ícone de menu (3 pontinhos) pode levar mais que os 5s fixos de antes pra aparecer
+    // enquanto o SIP ainda está registrando; espera ele existir de verdade antes de contar/clicar.
+    await buttons.first().waitFor({ state: 'visible', timeout: 20_000 });
     const count = await buttons.count();
     for (let index = 0; index < count; index++) {
       await page.keyboard.press('Escape');
@@ -292,8 +300,10 @@ class CvortexBrowserProvider {
     if (this.active && !this.active.ended) throw new Error('O webphone já possui uma chamada controlada por este processo.');
     if (!options.callId || !options.agentId || !options.patientName.trim()) throw new Error('Dados da chamada incompletos.');
     const digits = phoneDigits(options.phone);
-    // Dá tempo do webphone terminar de desmontar a ligação anterior antes de recarregar a página (ligações seguidas da
-    // esteira recarregavam rápido demais e o cVortex clicava no lugar errado).
+    // Dá uma folga pro webphone terminar de desmontar a ligação anterior antes de abrir o menu de novo.
+    // 2s não é suficiente: o cVortex pode levar mais tempo que isso pra liberar a linha do lado dele
+    // mesmo depois do ícone de "ligação ativa" já ter sumido da tela, o que faz a ligação anterior
+    // "voltar" como se fosse uma chamada entrando quando se tenta discar de novo rápido demais.
     const settle = this.lastFinishedAt + 5_000 - Date.now();
     if (settle > 0) await new Promise(resolve => setTimeout(resolve, settle));
     const page = await this.getPage();
@@ -305,11 +315,10 @@ class CvortexBrowserProvider {
     let clicked = false;
     let rejected = false;
     try {
-      await page.reload({ waitUntil: 'domcontentloaded' });
+      // Sem reload: a aba fica logada o dia todo (igual o bot-amei faz com a extensão), e cada ligação
+      // nova parte do estado atual da página ao vivo. Isso tira de uma vez a classe inteira de bug que
+      // vinha do SIP tendo que reinicializar e o DOM recarregar do zero a cada ligação.
       await page.getByRole('button', { name: 'Pausa' }).waitFor({ state: 'visible', timeout: 15_000 });
-      // The voice menu appears after the toolbar while SIP registration is still initializing.
-      await page.waitForTimeout(5000);
-      if (await page.locator('svg[aria-label="Call End"]').count()) throw new Error('Há uma chamada ativa no webphone.');
       await this.openCallMenu(page);
       await page.getByText('Ligar para um Colaborador', { exact: true }).click({ timeout: 8000 });
       await page.getByPlaceholder('Digite apenas números').fill(digits);
@@ -452,7 +461,8 @@ class CvortexBrowserProvider {
       muteLocal();
       const muteTimer = setInterval(muteLocal, 500);
       const unmuteLocal = () => { clearInterval(muteTimer); touched.forEach(media => { try { media.muted = false; } catch { /* removido */ } }); touched.clear(); };
-      const restore = async () => {
+      let restoring: Promise<boolean> | null = null;
+      const restore = (): Promise<boolean> => restoring ?? (restoring = (async () => {
         if (w.__cvActiveBridge?.socket !== socket) { unmuteLocal(); return sender.track === microphone; }
         unmuteLocal();
         try { if (sender.track !== microphone) await sender.replaceTrack(microphone); microphone.enabled = microphoneWasEnabled; } catch { return false; }
@@ -461,9 +471,9 @@ class CvortexBrowserProvider {
         for (const node of scheduled) { try { node.stop(); } catch { /* already ended */ } }
         processor.disconnect(); source.disconnect(); silent.disconnect(); output.disconnect();
         try { socket.close(); } catch { /* already closed */ }
-        await context.close();
+        try { await context.close(); } catch { /* already closed by a concurrent restore() */ }
         return true;
-      };
+      })());
       w.__cvActiveBridge = { socket, restore };
       // Antes, tentávamos adivinhar "o paciente atendeu" analisando volume/frequência do áudio recebido
       // (distinguir tom de chamada de fala) — um heurístico caseiro que ou demorava demais, ou disparava

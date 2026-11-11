@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Pencil, Phone, Plus, Search, Trash2, Upload, X } from 'lucide-react'
 import { api } from './api'
-import { parseContacts } from './parseContacts'
+import { parseContacts, readContactsFile } from './parseContacts'
 import type { Contact } from './types'
 
 const resultLabels: Record<string, string> = { interested: 'Interessado', not_interested: 'Sem interesse', callback: 'Retornar depois', do_not_contact: 'Não deseja contato', unknown: 'Não identificado' }
@@ -17,13 +17,15 @@ function formatPhone(value: string) {
 }
 function shortDate(value?: string | null) { return value ? new Intl.DateTimeFormat('pt-BR', { dateStyle: 'short' }).format(new Date(value)) : '—' }
 
-export function ContactsPanel({ onNotice, onCall }: { onNotice: (message: string) => void; onCall: (name: string, phone: string) => void }) {
+export function ContactsPanel({ onNotice, onCall }: { onNotice: (message: string) => void; onCall: (name: string, phone: string, source: Contact['source']) => void }) {
   const [contacts, setContacts] = useState<Contact[] | null>(null)
   const [query, setQuery] = useState('')
   const [filter, setFilter] = useState<Filter>('todos')
   const [editing, setEditing] = useState<Partial<Contact> | null>(null)
   const [importing, setImporting] = useState(false)
   const [pasted, setPasted] = useState('')
+  const [importAsCard, setImportAsCard] = useState(false)
+  const [cardSince, setCardSince] = useState('')
   const [busy, setBusy] = useState(false)
 
   const load = () => api.contacts().then(setContacts).catch((cause) => { setContacts([]); onNotice(cause instanceof Error ? cause.message : 'Não foi possível carregar os contatos.') })
@@ -61,13 +63,18 @@ export function ContactsPanel({ onNotice, onCall }: { onNotice: (message: string
   async function readFile(file: File | undefined) {
     if (!file) return
     if (file.size > 1_500_000) { onNotice('Arquivo muito grande (máx. 1,5 MB).'); return }
-    setPasted(await file.text())
+    try { setPasted(await readContactsFile(file)) } catch { onNotice('Não consegui ler esse arquivo. Confira se é um .csv, .txt, .xlsx ou .xls válido.') }
+    // Relatório de filiação do Cartão de TODOS vem como "relatorio-filiacao-...-01082021-31082021.csv":
+    // já marca a origem e pega o ano do período, pra Giovana dizer "desde 2021".
+    const period = /(\d{2})(\d{2})((?:19|20)\d{2})-(\d{2})(\d{2})((?:19|20)\d{2})/.exec(file.name)
+    if (/filia/i.test(file.name) || period) setImportAsCard(true)
+    if (period) setCardSince(period[3])
   }
   async function runImport() {
     setBusy(true)
     try {
-      const r = await api.importContacts(preview.slice(0, 5000))
-      setImporting(false); setPasted(''); await load()
+      const r = await api.importContacts(preview.slice(0, 5000), importAsCard ? 'cartao_de_todos' : 'planilha', importAsCard ? cardSince.trim() : undefined)
+      setImporting(false); setPasted(''); setImportAsCard(false); setCardSince(''); await load()
       onNotice(`${r.imported} importados${r.duplicates ? ` · ${r.duplicates} já existiam` : ''}${r.invalidCount ? ` · ${r.invalidCount} ignorados (telefone inválido)` : ''}.`)
     } catch (cause) { onNotice(cause instanceof Error ? cause.message : 'Não foi possível importar.') } finally { setBusy(false) }
   }
@@ -93,7 +100,7 @@ export function ContactsPanel({ onNotice, onCall }: { onNotice: (message: string
         <td>{formatPhone(c.phone)}</td><td>{sourceLabels[c.source]}</td><td>{c.callCount}</td><td>{shortDate(c.lastCallAt)}</td>
         <td>{c.doNotContact ? <span className="tag tag-block">Não contatar</span> : c.lastResult ? resultLabels[c.lastResult] : '—'}</td>
         <td className="row-actions" onClick={(e) => e.stopPropagation()}>
-          <button title="Ligar agora" disabled={c.doNotContact} onClick={() => onCall(c.name, c.phone)}><Phone size={14}/></button>
+          <button title="Ligar agora" disabled={c.doNotContact} onClick={() => onCall(c.name, c.phone, c.source)}><Phone size={14}/></button>
           <button title={c.doNotContact ? 'Liberar contato' : 'Marcar como não contatar'} onClick={() => void toggleBlock(c)}>{c.doNotContact ? 'Liberar' : 'Bloquear'}</button>
           <button title="Editar" onClick={() => setEditing(c)}><Pencil size={14}/></button>
           <button title="Excluir" onClick={() => void remove(c)}><Trash2 size={14}/></button>
@@ -112,11 +119,14 @@ export function ContactsPanel({ onNotice, onCall }: { onNotice: (message: string
     {importing && <div className="modal-backdrop" onClick={() => setImporting(false)}><div className="modal" onClick={(e) => e.stopPropagation()}>
       <button className="modal-close" onClick={() => setImporting(false)}><X size={20}/></button>
       <span className="eyebrow">IMPORTAÇÃO</span><h2>Importar planilha</h2>
-      <p className="muted">No Excel, use <b>Salvar como → CSV</b>. A planilha precisa ter nome e telefone (com DDD); a primeira linha pode ser o cabeçalho. Telefones repetidos são ignorados.</p>
-      <label>Arquivo CSV<input type="file" accept=".csv,.txt,text/csv,text/plain" onChange={(e) => void readFile(e.target.files?.[0])}/></label>
+      <p className="muted">Envie o arquivo direto do Excel (.xlsx/.xls) ou um .csv. A planilha precisa ter nome e telefone (com DDD), em qualquer ordem de colunas; a primeira linha pode ser o cabeçalho. Telefones repetidos são ignorados.</p>
+      <label>Arquivo CSV ou Excel<input type="file" accept=".csv,.txt,.xlsx,.xls,text/csv,text/plain,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel" onChange={(e) => void readFile(e.target.files?.[0])}/></label>
       <label>…ou cole aqui (nome e telefone, um por linha)<textarea rows={6} value={pasted} onChange={(e) => setPasted(e.target.value)} placeholder={'Maria Silva;(17) 99654-3210\nJosé Santos;17 99712-0000'}/></label>
       {pasted && <p className="muted">{preview.length} linha{preview.length === 1 ? '' : 's'} encontrada{preview.length === 1 ? '' : 's'}{preview[0] ? ` · ex.: ${preview[0].name || 'Sem nome'} — ${preview[0].phone}` : ''}{preview.length > 5000 ? ' · só as primeiras 5000 serão importadas' : ''}</p>}
-      <button className="call-button" disabled={busy || !preview.length} onClick={() => void runImport()}>{busy ? 'Importando...' : `Importar ${preview.length || ''} contatos`}</button>
+      <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={importAsCard} onChange={(e) => setImportAsCard(e.target.checked)}/> Esta lista é da base do Cartão de TODOS (reativação de filiados antigos)</label>
+      {importAsCard && <label>Filiados desde (ano)<input inputMode="numeric" maxLength={4} placeholder="2021" value={cardSince} onChange={(e) => setCardSince(e.target.value.replace(/\D/g, ''))}/></label>}
+      {importAsCard && <p className="muted">Linhas sem telefone ficam de fora sozinhas; a Giovana só cita o ano se ele estiver preenchido.</p>}
+      <button className="call-button" disabled={busy || !preview.length || (importAsCard && cardSince !== '' && !/^(19|20)\d{2}$/.test(cardSince))} onClick={() => void runImport()}>{busy ? 'Importando...' : `Importar ${preview.length || ''} contatos`}</button>
     </div></div>}
   </div>
 }
